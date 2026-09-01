@@ -23,16 +23,12 @@ STATE = {
 LOCK = threading.Lock()
 STOP = threading.Event()
 
-def get_ffmpeg_cmd():
-    custom = "/data/openpilot/server/ffmpeg_full"
-    return custom if os.path.exists(custom) and os.access(custom, os.X_OK) else "ffmpeg"
-
 def load_custom_settings():
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, "r") as f: return json.load(f)
     except: pass
-    return {"speed_offset": False, "speed_trim": 0.0}
+    return {"speed_offset": False, "auto_resume": False}
 
 def save_custom_settings(sd):
     try:
@@ -84,14 +80,14 @@ def read_params():
 
         custom = load_custom_settings()
         r["speed_offset"] = bool(custom.get("speed_offset", False))
-        r["speed_trim"] = float(custom.get("speed_trim", 0.0))
+        r["auto_resume"] = bool(custom.get("auto_resume", False))
         
         r["personality"] = PERSONALITIES.get(r["personality_raw"], "unknown")
         return r
     except:
         return {"personality_raw": 1, "follow_distance": 4, 
                 "adaptive_accel": False, "experimental": False, 
-                "speed_offset": False, "speed_trim": 0.0, "personality": "standard"}
+                "speed_offset": False, "auto_resume": False, "personality": "standard"}
 
 def get_routes():
     routes_dict = {}
@@ -188,8 +184,6 @@ def telemetry():
                         "vCruise": v_cruise,
                         "brakePressed": bool(safe_attr(cs, 'brakePressed', False)),
                         "gasPressed": bool(safe_attr(cs, 'gasPressed', False)),
-                        "gasRaw": num(safe_attr(cs, 'gas', 0)),
-                        "batteryPct": num(safe_attr(cs, 'fuelGauge', 0)) or num(safe_attr(cs, 'usableBatteryLevel', 0)) or num(safe_attr(cs, 'batterySoc', 0)),
                         "leftBlinker": bool(safe_attr(cs, 'leftBlinker', False)),
                         "rightBlinker": bool(safe_attr(cs, 'rightBlinker', False))
                     },
@@ -215,24 +209,13 @@ def write_setting(name, value):
     elif name in ("adaptive_accel", "experimental"):
         try: p.put_bool(PARAMS[name], bool(value))
         except: p.put(PARAMS[name], 1 if bool(value) else 0)
-    elif name in ("speed_offset", "speed_trim"):
+    elif name in ("speed_offset", "auto_resume"):
         custom = load_custom_settings()
-        custom[name] = float(value) if name == "speed_trim" else bool(value)
+        custom[name] = bool(value)
         save_custom_settings(custom)
         
     time.sleep(0.05)
     return read_params()
-
-_FFMPEG_HAS_ASS = None
-def ffmpeg_has_ass_filter():
-    global _FFMPEG_HAS_ASS
-    ff_cmd = get_ffmpeg_cmd()
-    try:
-        r = subprocess.run([ff_cmd, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10)
-        _FFMPEG_HAS_ASS = " ass " in r.stdout or "\nass " in r.stdout
-    except Exception:
-        _FFMPEG_HAS_ASS = False
-    return _FFMPEG_HAS_ASS
 
 def find_log_path(seg_dir):
     for f in ["rlog.zst", "rlog.bz2", "qlog.zst", "qlog.bz2"]:
@@ -242,79 +225,81 @@ def find_log_path(seg_dir):
 
 def parse_telemetry_timeline(log_path):
     import sys
-    if "/data/openpilot" not in sys.path:
-        sys.path.insert(0, "/data/openpilot")
+    if "/data/openpilot" not in sys.path: sys.path.insert(0, "/data/openpilot")
     from tools.lib.logreader import LogReader
 
-    timeline = []
-    vEgo = steer = lead_d = 0.0
-    gas = brake = left_b = right_b = engaged = False
+    lr = LogReader(log_path)
+    timeline, engagement = [], []
+    vEgo, steer, gas, brake, lead_d = 0.0, 0.0, False, False, 0.0
+    left_b, right_b, engaged = False, False, False
     t0 = None
-    next_idx = 0
 
-    def sample():
-        return [
-            round(num(vEgo) * 2.23694, 1), round(num(steer), 1),
-            1 if gas else 0, 1 if brake else 0, round(num(lead_d), 1),
-            1 if left_b else 0, 1 if right_b else 0, 1 if engaged else 0,
-        ]
-
-    for msg in LogReader(log_path):
+    for msg in lr:
         try:
             w = msg.which()
-            if w not in ("carState", "radarState", "selfdriveState", "controlsState"): continue
-            t = float(msg.logMonoTime) / 1e9
+            if w not in ("carState","radarState","selfdriveState","controlsState"):
+                continue
+            t = msg.logMonoTime / 1e9
             if t0 is None: t0 = t
             rel_t = t - t0
-            if rel_t < 0 or rel_t > 120.0: continue
+            if rel_t < 0 or rel_t > 61.0: continue
 
             if w == "carState":
                 cs = msg.carState
-                vEgo = num(getattr(cs, "vEgo", 0))
-                steer = num(getattr(cs, "steeringAngleDeg", 0))
-                gas = bool(getattr(cs, "gasPressed", False))
-                brake = bool(getattr(cs, "brakePressed", False))
-                left_b = bool(getattr(cs, "leftBlinker", False))
-                right_b = bool(getattr(cs, "rightBlinker", False))
+                vEgo = getattr(cs, "vEgo", 0)
+                steer = getattr(cs, "steeringAngleDeg", 0)
+                gas = getattr(cs, "gasPressed", False)
+                brake = getattr(cs, "brakePressed", False)
+                left_b = getattr(cs, "leftBlinker", False)
+                right_b = getattr(cs, "rightBlinker", False)
             elif w == "radarState":
                 lead = getattr(msg.radarState, "leadOne", None)
-                lead_d = num(getattr(lead, "dRel", 0)) if lead and bool(getattr(lead, "status", False)) else 0.0
-            else:
-                active = getattr(getattr(msg, w), "active", None)
+                lead_d = getattr(lead, "dRel", 0) if (lead and getattr(lead, "status", False)) else 0
+            elif w == "selfdriveState":
+                sd = msg.selfdriveState
+                active = getattr(sd, "active", None)
                 if active is not None: engaged = bool(active)
+            elif w == "controlsState":
+                ctl = msg.controlsState
+                active = getattr(ctl, "active", None)
+                if active is not None and bool(active): engaged = True
+                elif active is False: engaged = False
 
-            target_idx = min(1199, int(rel_t * 10))
-            while next_idx <= target_idx:
-                timeline.append(sample())
-                next_idx += 1
-            if len(timeline) >= 1200: break
-        except Exception: continue
-    return timeline, [1 if f[7] else 0 for f in timeline]
+            expected_idx = int(rel_t * 10)
+            while len(timeline) <= expected_idx and len(timeline) < 600:
+                timeline.append([
+                    round(vEgo * 2.23694, 1), round(steer, 1),
+                    1 if gas else 0, 1 if brake else 0, round(lead_d, 1),
+                    1 if left_b else 0, 1 if right_b else 0, 1 if engaged else 0
+                ])
+                engagement.append(1 if engaged else 0)
+        except: continue
+
+    if engagement:
+        last = engagement[0]
+        for i in range(len(engagement)):
+            if engagement[i]: last = 1
+            elif last: engagement[i] = 1
+        for i, value in enumerate(engagement):
+            if i < len(timeline): timeline[i][7] = value
+
+    return timeline, engagement
 
 def get_mp4_path(route_seg, cam_type="qcamera"):
     base_path = f"/data/media/0/realdata/{route_seg}/{cam_type}"
     cam_file = base_path + ".hevc"
-    is_hevc = True
-    if not os.path.exists(cam_file): 
-        cam_file = base_path + ".ts"
-        is_hevc = False
+    if not os.path.exists(cam_file): cam_file = base_path + ".ts"
     if not os.path.exists(cam_file): return None
       
     tmp_path = f"/dev/shm/vid_{route_seg}_{cam_type}.mp4"
-    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
-        try:
-            cmd = ["ffmpeg", "-y", "-i", cam_file, "-c", "copy", "-movflags", "+faststart"]
-            if is_hevc: 
-                cmd.extend(["-tag:v", "hvc1"]) # ONLY apply Apple HEVC tag if the file is actually HEVC!
-            cmd.append(tmp_path)
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception: pass
-    
-    return tmp_path if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1024 else cam_file
+    if not os.path.exists(tmp_path):
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", cam_file, "-c", "copy", "-movflags", "faststart", tmp_path], 
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    return tmp_path if os.path.exists(tmp_path) else None
 
 def serve_file_with_range(handler, path, content_type="video/mp4", attachment=None):
-    if path.endswith(".ts"): content_type = "video/mp2t"
-    elif path.endswith(".hevc"): content_type = "video/hevc"
     try: file_size=os.path.getsize(path)
     except OSError: handler.send_error(404); return
     if file_size<=0: handler.send_error(404); return
@@ -349,65 +334,58 @@ def serve_file_with_range(handler, path, content_type="video/mp4", attachment=No
                 handler.wfile.write(chunk);remaining-=len(chunk)
     except (BrokenPipeError,ConnectionResetError): pass
 
+
 HTML = r"""<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>NAP Dash</title><style>
-:root{--p:#111720;--line:#293241;--t:#f5f7fa;--m:#9aa7b7;--a:#56b6ff;--g:#34c759;--glow:rgba(86,182,255,0.6);}
+:root{--p:#111720;--line:#293241;--t:#f5f7fa;--m:#9aa7b7;--a:#56b6ff;--g:#34c759;}
 *{box-sizing:border-box}
 body{margin:0;background:#05070a;color:var(--t);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif;}
 .wrap{max-width:980px;margin:auto;padding:10px}
-@media(max-width:600px){ .wrap{padding:4px;} }
 
-.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:0 4px;}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .title{font-size:18px;font-weight:800}
 .health-bar{font-size:11px;color:var(--m);display:flex;gap:10px;}
 .nav-tabs{display:flex;gap:8px;margin-bottom:12px;background:#111720;padding:4px;border-radius:12px;border:1px solid var(--line)}
 .nav-tabs button{flex:1;background:transparent;border:none;color:var(--m);padding:8px;font-weight:700;border-radius:8px;font-size:13px}
 .nav-tabs button.active{background:#1a222e;color:var(--t)}
 
-/* EDGE-TO-EDGE 3D CLUSTER */
-.cluster{position:relative;background:radial-gradient(circle at center 80%, #0c1424 0%, #04070c 100%);border-radius:24px;border:1px solid #1a2a40;overflow:hidden;display:flex;flex-direction:column;align-items:center;margin-bottom:15px;aspect-ratio:4/3;width:100%;box-shadow:inset 0 0 60px rgba(0,0,0,0.8), 0 0 20px rgba(86,182,255,0.1);}
-@media(max-width:600px){ .cluster{border-radius:16px;} }
+.cluster{position:relative;background:radial-gradient(circle at center, #111720 0%, #05070a 100%);border-radius:20px;border:1px solid #293241;overflow:hidden;display:flex;flex-direction:column;align-items:center;padding-top:15px;margin-bottom:15px;aspect-ratio:3/4;box-shadow:inset 0 0 40px #000;}
 @media(min-width:600px){.cluster{aspect-ratio:16/9;}}
-.cluster-overlay{position:absolute;inset:0;padding:16px;z-index:10;display:flex;flex-direction:column;justify-content:space-between;pointer-events:none;}
-.cluster-top{display:flex;justify-content:space-between;width:100%;align-items:flex-start;}
+.cluster-top{display:flex;justify-content:space-between;width:100%;padding:0 20px;z-index:10;align-items:flex-start;}
 
 .speed-block{text-align:center;display:flex;flex-direction:column;align-items:center;}
-.speed-val{font-size:76px;font-weight:900;line-height:1;letter-spacing:-2.5px;text-shadow:0 0 30px rgba(255,255,255,0.3);}
-.speed-unit{font-size:16px;color:var(--m);font-weight:800;}
+.speed-val{font-size:64px;font-weight:800;line-height:1;letter-spacing:-2px;text-shadow:0 0 20px rgba(255,255,255,0.2);}
+.speed-unit{font-size:14px;color:var(--m);font-weight:700;}
 
-.max-speed, .lead-badge, .steer-block{display:flex;flex-direction:column;align-items:center;background:rgba(12,20,36,0.6);padding:8px 12px;border-radius:12px;border:1px solid #2a3e5c;backdrop-filter:blur(6px);}
-.max-lbl{font-size:11px;color:var(--m);font-weight:900;}
-.max-val{font-size:22px;font-weight:900;color:var(--a);text-shadow:0 0 15px var(--glow);}
-.steer-val{font-size:14px;font-weight:900;color:#fff;}
-.wheel-icon{width:36px;height:36px;color:var(--t);transition:transform 0.1s ease-out;will-change:transform;filter:drop-shadow(0 0 8px rgba(255,255,255,0.4));margin-bottom:4px;}
+.max-speed{display:flex;flex-direction:column;align-items:center;background:rgba(26,34,46,0.6);padding:6px 12px;border-radius:10px;border:1px solid #344153;backdrop-filter:blur(4px);}
+.max-lbl{font-size:10px;color:var(--m);font-weight:800;}
+.max-val{font-size:22px;font-weight:800;color:var(--a);text-shadow:0 0 10px rgba(86,182,255,0.4);}
 
-.trim-btn {background:#162032; border:1px solid #324a6e; color:#ffffff; font-size:20px; font-weight:800; width:64px; height:56px; border-radius:12px; cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.5); display:inline-flex; justify-content:center; align-items:center; transition:0.2s;}
-.trim-btn:active {background:var(--a); color:#000; border-color:var(--a); transform:scale(0.95);}
-.trim-display{min-width:56px;text-align:center;font-weight:900;font-size:20px;color:var(--a);}
+.steer-block{display:flex;flex-direction:column;align-items:center;background:rgba(26,34,46,0.6);padding:6px 12px;border-radius:10px;border:1px solid #344153;backdrop-filter:blur(4px);}
+.steer-val{font-size:22px;font-weight:800;color:#fff;}
 
 .radar-canvas{position:absolute;inset:0;width:100%;height:100%;z-index:1;}
-.hud-pedals{display:flex;gap:12px;pointer-events:auto;}
-.pedal{width:36px;height:10px;border-radius:5px;background:#1a2a40;transition:0.1s;border:1px solid #2a3e5c;}
-.pedal.brk.active{background:#ff3b30;border-color:#ff5d67;box-shadow:0 0 16px #ff3b30;}
-.pedal.gas.active{background:var(--g);border-color:#5de37e;box-shadow:0 0 16px var(--g);}
+.hud-pedals{position:absolute;bottom:15px;left:15px;display:flex;gap:10px;z-index:10;}
+.pedal{width:30px;height:8px;border-radius:4px;background:#344153;transition:0.1s;}
+.pedal.brk.active{background:#ff3b30;box-shadow:0 0 10px #ff3b30;}
+.pedal.gas.active{background:var(--g);box-shadow:0 0 10px var(--g);}
 
-.turn-arrow{font-size:28px;color:#1a2a40;transition:0.15s;}
-.turn-arrow.active{color:var(--g);text-shadow:0 0 15px var(--g);}
+.turn-arrow{font-size:24px;color:#293241;transition:0.15s;}
+.turn-arrow.active{color:var(--g);text-shadow:0 0 10px var(--g);}
 
-@keyframes flow { from { stroke-dashoffset: 40; } to { stroke-dashoffset: 0; } }
-.dash-flow { animation: flow 0.5s linear infinite; }
-
-.grid-layout{display:grid;grid-template-columns:1fr;gap:10px;}
+.grid-layout{display:grid;grid-template-columns:1fr;gap:12px;}
 @media(min-width:600px){.grid-layout{grid-template-columns:1fr 1fr;}}
 .card{background:#111720;border:1px solid var(--line);border-radius:16px;padding:14px;}
 .label{font-size:12px;color:var(--m);text-transform:uppercase;letter-spacing:.08em;margin-bottom:9px}
 .buttons{display:flex;gap:8px}.btn{flex:1;border:1px solid #344153;background:#1a222e;color:var(--t);padding:10px 6px;border-radius:10px;font-weight:700;font-size:13px;}
 .btn.active{background:#284d68;border-color:var(--a)}
-.row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0}.small{font-size:12px;color:var(--m)}
 .switch{width:50px;height:28px;border-radius:16px;background:#303a47;border:0;position:relative;cursor:pointer;}.switch i{position:absolute;width:22px;height:22px;top:3px;left:3px;border-radius:50%;background:#fff;transition:.15s}.switch.on{background:var(--g)}.switch.on i{left:25px}
 .follow{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.follow button{padding:10px 2px;border-radius:8px;border:1px solid #344153;background:#1a222e;color:#fff;font-weight:700}.follow button.active{background:#315b75;border-color:var(--a)}
 
-/* DASHCAM VIDEO ELEMENTS */
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:5px;font-size:11px}.kv span{color:var(--m)}
+
+/* Video */
 .vid-container{width:100%;position:relative;aspect-ratio:16/9;background:#000;border-radius:16px;overflow:hidden;margin-bottom:12px;border:1px solid var(--line)}
 video{width:100%;height:100%}
 .hud-overlay{position:absolute;inset:0;pointer-events:none;padding:15px;display:none;flex-direction:column;justify-content:space-between;z-index:20;background:linear-gradient(180deg, rgba(0,0,0,0.5) 0%, transparent 20%, transparent 80%, rgba(0,0,0,0.6) 100%);}
@@ -418,15 +396,16 @@ video{width:100%;height:100%}
 .hud-pedal-label{font-size:9px;font-weight:800;letter-spacing:.06em;color:#8f9baa;text-shadow:0 1px 3px #000;}
 .pedal.brk.active + .hud-pedal-label{color:#ff5d67;}
 .pedal.gas.active + .hud-pedal-label{color:var(--g);}
-.steer-wrap{width:100%; margin-top:2px; display:flex; justify-content:center;}
-.wheel-icon.hud{width:30px;height:30px;color:#fff;}
+.steer-wrap{width:100%; margin-top:4px; display:flex; justify-content:center;}
+.steer-gauge{width:100px; height:6px; background:#293241; border-radius:3px; position:relative;}
+.steer-center{position:absolute; width:2px; height:10px; background:#8f9baa; left:50%; top:-2px; transform:translateX(-50%);}
+.steer-ind{position:absolute; width:12px; height:10px; background:#fff; border-radius:2px; top:-2px; left:50%; transform:translateX(-50%); transition:transform 0.1s ease-out;}
 select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;padding:8px 12px;border-radius:10px;font-weight:700;font-size:13px;outline:none;width:100%;margin-bottom:10px;}
 .route-item{background:#111720;border-radius:12px;padding:12px;margin-bottom:10px;border:1px solid var(--line)}
 .segs-grid{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
-.seg-btn{background:#1a222e;border:1px solid #344153;color:var(--t);padding:8px 12px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;}
-.seg-btn:active{background:var(--a)}
-.seg-btn.playing{background:var(--a);color:#000;border-color:var(--a)}
-.btn-ui{text-decoration:none;padding:8px 14px;background:#1a222e;color:var(--t);border-radius:10px;font-weight:700;font-size:13px;border:1px solid #344153;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;}
+.seg-btn{background:#1a222e;border:1px solid #344153;color:var(--t);padding:8px 12px;border-radius:8px;font-size:12px;font-weight:700}
+.seg-btn:active{background:var(--a)}.seg-btn.playing{background:var(--a);color:#000}
+.btn-ui{text-decoration:none;padding:8px 14px;background:#1a222e;color:var(--t);border-radius:10px;font-weight:700;font-size:13px;border:1px solid #344153;cursor:pointer;}
 .timeline{background:#111720;border:1px solid var(--line);border-radius:16px;padding:12px;margin-bottom:12px;}
 .timeline-head{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;color:var(--m);margin-bottom:8px;}
 .timeline input[type=range]{width:100%;accent-color:var(--a);margin:0;}
@@ -440,7 +419,7 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
 </style></head><body><div class=wrap>
 
 <div class=top>
-  <div class=title>NAP Dash <span style="font-size:10px;color:var(--a);margin-left:4px">v3D WIDE</span></div>
+  <div class=title>NAP Dash</div>
   <div class=health-bar>
     <span>CPU: <b id="cpu-temp">—</b>°C</span>
     <span><b id="status">Wait</b></span>
@@ -453,107 +432,56 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
 </div>
 
 <div id="tab-drive">
+  
   <div class="cluster">
-    <svg class="radar-canvas" viewBox="0 0 200 240" preserveAspectRatio="none">
+    <div class="cluster-top">
+      <div id="arr-l" class="turn-arrow">◀</div>
+      <div class="steer-block"><span class="max-lbl">STEER</span><span id="steer-val" class="steer-val">0°</span></div>
+      <div class="speed-block">
+        <div id="speed-val" class="speed-val">0</div>
+        <div class="speed-unit">MPH</div>
+      </div>
+      <div class="max-speed"><span class="max-lbl">MAX</span><span id="max-val" class="max-val">--</span></div>
+      <div id="arr-r" class="turn-arrow">▶</div>
+    </div>
+    
+    <svg class="radar-canvas" viewBox="0 0 200 300" preserveAspectRatio="xMidYMax slice">
       <defs>
-        <filter id="neonGlow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="2" result="blur1" />
-          <feGaussianBlur stdDeviation="5" result="blur2" />
-          <feMerge>
-            <feMergeNode in="blur2" />
-            <feMergeNode in="blur1" />
-            <feMergeNode in="SourceGraphic" />
-          </feMerge>
+        <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
         </filter>
-        <linearGradient id="laneGrad" x1="0" y1="1" x2="0" y2="0">
-          <stop offset="0%" stop-color="var(--a)" stop-opacity="0.8"/>
-          <stop offset="100%" stop-color="var(--a)" stop-opacity="0.0"/>
-        </linearGradient>
       </defs>
+      <path d="M62 280 L78 85 L122 85 L138 280 Z" fill="#0b1017" stroke="#293241" stroke-width="1" opacity="0.95"/>
+      <path d="M87 280 L96 85 M113 280 L104 85" stroke="#293241" stroke-width="1" stroke-dasharray="6 8" opacity="0.75"/>
+      <path d="M74 220 L126 220 M79 165 L121 165 M84 115 L116 115" stroke="#293241" stroke-width="1" opacity="0.65"/>
+      <circle cx="100" cy="280" r="50" fill="none" stroke="#293241" stroke-width="1"/>
+      <circle cx="100" cy="280" r="100" fill="none" stroke="#293241" stroke-width="1"/>
+      <circle cx="100" cy="280" r="150" fill="none" stroke="#293241" stroke-width="1"/>
+      <circle cx="100" cy="280" r="200" fill="none" stroke="#293241" stroke-width="1"/>
       
-      <!-- Moving Physics Grid -->
-      <g id="grid-lines" opacity="0.45"></g>
-      <line x1="0" y1="80" x2="200" y2="80" stroke="#56b6ff" stroke-width="2" filter="url(#neonGlow)" opacity="0.5"/>
-
-      <!-- Fat Glowing AI Ribbon -->
-      <polygon id="ai-path" points="" fill="url(#laneGrad)" opacity="0.85" />
-      <path id="ai-left" d="" fill="none" stroke="#56b6ff" stroke-width="2" opacity="0.8" filter="url(#neonGlow)" />
-      <path id="ai-right" d="" fill="none" stroke="#56b6ff" stroke-width="2" opacity="0.8" filter="url(#neonGlow)" />
+      <!-- Actual Steering Angle Projection (Dashed Yellow) -->
+      <path id="steer-path" fill="none" stroke="#ffcc00" stroke-width="4" stroke-dasharray="8 6" opacity="0.8" filter="url(#glow)" stroke-linecap="round"/>
       
-      <!-- Thick Flowing Center Line -->
-      <path id="ai-center" d="" fill="none" stroke="#56b6ff" stroke-width="6" stroke-dasharray="24 16" stroke-linecap="round" filter="url(#neonGlow)" class="dash-flow" opacity="0.9" />
+      <!-- AI Predicted Path (Solid Blue/Green) -->
+      <path id="ai-path" fill="none" stroke="#56b6ff" stroke-width="6" opacity="0.8" stroke-linecap="round" filter="url(#glow)"/>
       
-      <!-- Thick Arcing Steer Prediction -->
-      <path id="steer-path" d="" fill="none" stroke="#ffcc00" stroke-width="5" stroke-dasharray="14 10" stroke-linecap="round" filter="url(#neonGlow)" class="dash-flow" opacity="0.95"/>
-
-      <!-- 3D Lead Car Box -->
-      <g id="lead-grp" style="display:none; transition: transform 0.05s linear;">
-        <rect x="-14" y="-28" width="28" height="18" rx="3" fill="rgba(0,0,0,0.6)" stroke="#ffb656" stroke-width="2" filter="url(#neonGlow)"/>
-        <rect x="-10" y="-8" width="6" height="3" rx="1.5" fill="#ff5d67" filter="url(#neonGlow)"/>
-        <rect x="4" y="-8" width="6" height="3" rx="1.5" fill="#ff5d67" filter="url(#neonGlow)"/>
+      <g id="lead-grp" style="display:none; transition:transform 0.1s linear;">
+        <path d="M-13,-8 L-9,-13 L9,-13 L13,-8 L11,10 L-11,10 Z" fill="#ff5d67" filter="url(#glow)"/>
+        <path d="M-7,-10 L7,-10 L9,-3 L-9,-3 Z" fill="#24313d"/>
+        <rect x="-12" y="5" width="4" height="4" fill="#fff"/><rect x="8" y="5" width="4" height="4" fill="#fff"/>
+        <text id="lead-dist" x="0" y="-19" fill="#fff" font-size="11" font-weight="800" text-anchor="middle">--m</text>
+      </g>
+      <g transform="translate(100, 280)">
+        <path d="M-10,-15 L10,-15 L12,10 L-12,10 Z" fill="#f5f7fa" filter="url(#glow)"/>
+        <rect id="ego-brake" x="-10" y="10" width="6" height="4" fill="#ff3b30" opacity="0" filter="url(#glow)"/>
+        <rect id="ego-brake2" x="4" y="10" width="6" height="4" fill="#ff3b30" opacity="0" filter="url(#glow)"/>
       </g>
     </svg>
 
-    <div class="cluster-overlay">
-      <div class="cluster-top">
-        <div id="arr-l" class="turn-arrow">◀</div>
-        <div style="display:flex;align-items:flex-start;gap:12px;">
-          <div class="steer-block">
-            <svg id="wheel-cluster" class="wheel-icon" viewBox="0 0 40 40" fill="none">
-              <circle cx="20" cy="20" r="15" stroke="currentColor" stroke-width="3"/>
-              <circle cx="20" cy="20" r="4" fill="currentColor"/>
-              <line x1="20" y1="5" x2="20" y2="13" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-              <line x1="20" y1="20" x2="8" y2="27" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-              <line x1="20" y1="20" x2="32" y2="27" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-            </svg>
-            <span id="steer-val" class="steer-val">0°</span>
-          </div>
-          <div class="speed-block">
-            <div id="speed-val" class="speed-val">0</div>
-            <div class="speed-unit">MPH</div>
-          </div>
-          <div style="display:flex;flex-direction:column;gap:8px;">
-            <div class="max-speed">
-              <span class="max-lbl">MAX</span>
-              <span id="max-val" class="max-val">--</span>
-            </div>
-            <div class="lead-badge">
-              <span class="max-lbl">LEAD</span>
-              <span id="lead-badge-val" class="max-val">--</span>
-            </div>
-          </div>
-        </div>
-        <div id="arr-r" class="turn-arrow">▶</div>
-      </div>
-      
-      <div style="display:flex; justify-content:space-between; align-items:flex-end; width:100%;">
-        <div class="hud-pedals">
-          <div id="pedal-brk" class="pedal brk"></div>
-          <div id="pedal-gas" class="pedal gas"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div style="display:flex; justify-content:space-between; margin-bottom:15px; gap:10px;">
-    <div class="card" style="flex:1; display:flex; align-items:center; justify-content:space-between; padding:12px 14px; margin:0; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
-      <span style="font-size:13px; color:var(--m); font-weight:800; letter-spacing:0.5px;">BATTERY</span>
-      <span id="ev-battery" style="font-size:20px; font-weight:900; color:#5de37e; text-shadow:0 0 10px rgba(93,227,126,0.3);">--%</span>
-    </div>
-    <div class="card" style="flex:1; display:flex; align-items:center; justify-content:space-between; padding:12px 14px; margin:0; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
-      <span style="font-size:13px; color:var(--m); font-weight:800; letter-spacing:0.5px;">PEDAL</span>
-      <span id="ev-pedal" style="font-size:20px; font-weight:900; color:var(--a); text-shadow:0 0 10px var(--glow);">0.0%</span>
-    </div>
-  </div>
-
-  <div class="card" style="margin-bottom:15px;">
-    <div class="label" style="text-align:center; margin-bottom:14px;">Cruise Speed Trim</div>
-    <div style="display:flex; justify-content:center; align-items:center; gap:14px;">
-      <button class="trim-btn" onclick="speedTrim(-5)">-5</button>
-      <button class="trim-btn" onclick="speedTrim(-1)">-1</button>
-      <span id="trim-display" class="trim-display">+0</span>
-      <button class="trim-btn" onclick="speedTrim(1)">+1</button>
-      <button class="trim-btn" onclick="speedTrim(5)">+5</button>
+    <div class="hud-pedals">
+      <div id="pedal-brk" class="pedal brk"></div>
+      <div id="pedal-gas" class="pedal gas"></div>
     </div>
   </div>
 
@@ -575,6 +503,13 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
       <div class=row><div><b>Experimental Mode</b></div><button id=exp class=switch onclick="toggle('experimental')"><i></i></button></div>
       <div class=row><div><b>Adaptive Accel</b></div><button id=ada class=switch onclick="toggle('adaptive_accel')"><i></i></button></div>
       <div class=row><div><b>+5 MPH Speed Offset</b></div><button id=spd class=switch onclick="toggle('speed_offset')"><i></i></button></div>
+      <div class=row><div><b>Lateral Auto-Resume</b></div><button id=aut class=switch onclick="toggle('auto_resume')"><i></i></button></div>
+    </div>
+    
+    <!-- Restored Lead Telemetry Box -->
+    <div class=card>
+      <div class=label>Lead Telemetry</div>
+      <div id=l1 class=kv></div>
     </div>
   </div>
 </div>
@@ -603,33 +538,13 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
         <div class="hud-box">
           STR: <span id="hud-steer">0</span>°
           <div class="steer-wrap">
-            <svg id="wheel-hud" class="wheel-icon hud" viewBox="0 0 40 40" fill="none">
-              <circle cx="20" cy="20" r="15" stroke="currentColor" stroke-width="3"/>
-              <circle cx="20" cy="20" r="4" fill="currentColor"/>
-              <line x1="20" y1="5" x2="20" y2="13" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-              <line x1="20" y1="20" x2="8" y2="27" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-              <line x1="20" y1="20" x2="32" y2="27" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-            </svg>
+            <div class="steer-gauge">
+              <div class="steer-center"></div>
+              <div id="steer-ind" class="steer-ind"></div>
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  </div>
-
-  <div class="timeline">
-    <div class="timeline-head"><span id="timeline-title">No clip selected</span><span id="timeline-time">00:00 / 00:00</span></div>
-    <input id="timeline-range" type="range" min="0" max="0" step="0.1" value="0" oninput="seekTimeline(this.value)">
-    <div id="engagement-track" class="timeline-track"></div>
-    <div class="event-legend"><span>● Green = engaged</span><span>Telemetry is synchronized to video time</span></div>
-  </div>
-
-  <div class="card" style="margin-bottom:12px;">
-    <div class="label">Comma Health</div>
-    <div class="health-grid">
-      <div class="health-pill">CPU TEMP<b id="health-temp">—</b></div>
-      <div class="health-pill">STORAGE<b id="health-storage">—</b></div>
-      <div class="health-pill">UPTIME<b id="health-uptime">—</b></div>
-      <div class="health-pill">LINK<b id="health-link">ONLINE</b></div>
     </div>
   </div>
   
@@ -638,23 +553,21 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
       <select id="cam-select" class="cam-drop" onchange="if(currentRoute) playVid(currentRoute, currentSeg, $('player').currentTime)" style="margin:0;">
         <option value="qcamera">Road (Fast)</option>
         <option value="fcamera">Road (High-Res)</option>
-        <option value="ecamera">Wide Road (Fisheye)</option>
         <option value="dcamera">Driver Cam</option>
       </select>
       <button class="btn-ui" onclick="toggleHud()">Toggle HUD</button>
     </div>
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+    <div style="display:flex; gap:10px; align-items:center;">
       <button class="btn-ui" onclick="togglePlay()" id="vid-play-btn" style="display:none;">Pause</button>
-      <a class="btn-ui" id="download-raw-btn" style="display:none;background:#284d68;color:#fff;" download>Download (No HUD) ↓</a>
       <button class="btn-ui" onclick="exportWithHud()" id="export-btn" style="display:none;background:var(--g);color:#000;">Export w/ HUD ↓</button>
     </div>
   </div>
+  
   <div id="routes-list"><div class="label" style="text-align:center;">Loading logs...</div></div>
 </div>
 
 <script>
 let S={settings:{}};const $=x=>document.getElementById(x);
-
 function switchTab(t){
   $('tab-drive').style.display = t==='drive'?'block':'none';
   $('tab-video').style.display = t==='video'?'block':'none';
@@ -663,30 +576,9 @@ function switchTab(t){
   if(t==='video') loadRoutes();
 }
 
-function speedTrim(delta){
-  let cur = Number((S.settings||{}).speed_trim || 0);
-  setv('speed_trim', Math.max(-20, Math.min(20, cur + delta)));
-}
-
-/* --- MASSIVE FOV 3D PROJECTION MATH --- */
-const CLUSTER_CX = 100, CLUSTER_GROUND_Y = 240, CLUSTER_HORIZON_Y = 80;
-const CLUSTER_FOCAL = 12.0;       // Lower = Wider camera lens 
-const CLUSTER_LAT_SCALE = 32.0;   // Higher = Fatter ribbon at the base
-const LAT_SIGN = -1;
-const WHEEL_SIGN = -1;
-
-function project(dMeters, lateralMeters){
-  let d = Math.max(0, dMeters);
-  let t = CLUSTER_FOCAL / (d + CLUSTER_FOCAL);
-  let x = CLUSTER_CX + (LAT_SIGN * lateralMeters * CLUSTER_LAT_SCALE * t);
-  let y = CLUSTER_GROUND_Y - (CLUSTER_GROUND_Y - CLUSTER_HORIZON_Y) * (1 - t);
-  return [x, y];
-}
-
-let gridOffset = 0;
-
-/* --- Video Logic Restored --- */
-let routesLoaded = false, currentRoute = null, currentSeg = null, hudActive = false, logData = [], videoDuration = 0;
+let routesLoaded = false;
+let currentRoute = null; let currentSeg = null;
+let hudActive = false; let logData = []; let videoDuration = 0; 
 
 function toggleHud(){
   hudActive = !hudActive;
@@ -697,24 +589,16 @@ function togglePlay(){
   if(v.paused) { v.play(); $('vid-play-btn').textContent = "Pause"; }
   else { v.pause(); $('vid-play-btn').textContent = "Play"; }
 }
+
 async function loadRoutes(){
   if(routesLoaded) return;
   try {
     let r = await fetch("/api/routes").then(x=>x.json());
     let h = r.length===0 ? "<div class='label'>No drives found.</div>" : "";
     r.forEach(rt => {
-      let readable = rt.name;
-      let pts = rt.name.includes("|") ? rt.name.split("|")[1] : rt.name;
-      let m = pts.match(/^(\d{4})-(\d{2})-(\d{2})--(\d{2})-(\d{2})-(\d{2})$/);
-      if(m){
-         let d = new Date(m[1], m[2]-1, m[3], m[4], m[5], m[6]);
-         readable = d.toLocaleString(undefined, {weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit'});
-      } else {
-         let d = pts.split("--");
-         readable = (d[0]||"Route") + " at " + (d[1]?d[1].replace(/-/g,":"):"");
-      }
-      let safeId = rt.name.replace(/[^a-zA-Z0-9-]/g, '_');
-      let btns = rt.segs.map(s => `<button id="btn-${safeId}-${s}" class="seg-btn" onclick="playVid('${rt.name}',${s})">Seg ${s}</button>`).join("");
+      let d = rt.name.includes("|") ? rt.name.split("|")[1].split("--") : rt.name.split("--");
+      let readable = (d[0]||"Route") + " at " + (d[1]?d[1].replace(/-/g,":"):"");
+      let btns = rt.segs.map(s => `<button class="seg-btn" onclick="playVid('${rt.name}',${s})">Seg ${s}</button>`).join("");
       h += `<div class="route-item"><b>${readable}</b><div class="segs-grid">${btns}</div></div>`;
     });
     $('routes-list').innerHTML = h; routesLoaded = true;
@@ -725,66 +609,29 @@ let logRequestId = 0;
 async function fetchLogData(route, seg){
   const reqId = ++logRequestId; logData = [];
   $('hud-speed').textContent = "..."; $('hud-steer').textContent = "...";
-  $('hud-lead').textContent = "..."; if($('wheel-hud')) $('wheel-hud').style.transform = `rotate(0deg)`;
+  $('hud-lead').textContent = "..."; $('steer-ind').style.transform = `translateX(-50%)`;
   try {
     let r = await fetch(`/api/log/${route}--${seg}`);
     let j = await r.json();
     if(reqId !== logRequestId) return; 
-    if(j.data && j.data.length) {
-      logData = j.data;
-      buildEngagementTrack();
-      $('hud-speed').textContent = logData[0][0].toFixed(0);
-      $('hud-steer').textContent = logData[0][1].toFixed(1);
-      $('hud-lead').textContent = logData[0][4] > 0 ? logData[0][4].toFixed(1) : '--';
-    } else {
-      $('hud-speed').textContent = "--";
-      $('hud-steer').textContent = "--";
-      $('hud-lead').textContent = "--";
-      $('timeline-title').textContent = `Telemetry unavailable — ${j.error || 'no data'}`;
-    }
-  } catch(e) {
-    $('timeline-title').textContent = `Telemetry error — ${e.message || e}`;
-  }
+    if(j.data && j.data.length) { logData = j.data; buildEngagementTrack(); }
+    else { $('hud-speed').textContent = "--"; $('hud-lead').textContent = "--"; }
+  } catch(e) {}
 }
 
 function playVid(route, seg, preserveTime=null){
   document.querySelectorAll('.seg-btn').forEach(b => b.classList.remove('playing'));
   currentRoute=route; currentSeg=seg;
-  
-  let safeId = route.replace(/[^a-zA-Z0-9-]/g, '_');
-  let activeBtn = document.getElementById(`btn-${safeId}-${seg}`);
-  if(activeBtn) activeBtn.classList.add('playing');
-  
   let cam=$('cam-select').value, vid=$('player'), oldTime=preserveTime===null?0:preserveTime;
-  vid.src=`/stream/${route}--${seg}?cam=${cam}`;
-  vid.onerror = () => { $('timeline-title').textContent = "Video format not supported natively by this browser."; };
-  vid.load();
+  vid.src=`/stream/${route}--${seg}?cam=${cam}`; vid.load();
   vid.addEventListener('loadedmetadata',function restore(){
     vid.removeEventListener('loadedmetadata',restore); videoDuration=isFinite(vid.duration)?vid.duration:60;
-    if($('timeline-range')) $('timeline-range').max=videoDuration.toFixed(1);
+    $('timeline-range').max=videoDuration.toFixed(1);
     if(oldTime>0) vid.currentTime=Math.min(oldTime,Math.max(0,videoDuration-0.1));
     vid.play().catch(()=>{});
   });
-  
-  $('vid-play-btn').style.display='inline-block'; 
-  $('vid-play-btn').textContent='Pause'; 
-  
-  let rawBtn = $('download-raw-btn');
-  rawBtn.style.display='inline-flex';
-  rawBtn.href=`/download/${route}--${seg}?cam=${cam}`;
-  rawBtn.download=`Clip_${route}_${seg}_${cam}.mp4`.replace(/[|]/g, '_');
-  
-  $('export-btn').style.display='inline-block';
-  
-  let pts = route.includes("|") ? route.split("|")[1] : route;
-  let m = pts.match(/^(\d{4})-(\d{2})-(\d{2})--(\d{2})-(\d{2})-(\d{2})$/);
-  let readTitle = route;
-  if(m){
-     let d = new Date(m[1], m[2]-1, m[3], m[4], m[5], m[6]);
-     readTitle = d.toLocaleString(undefined, {weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
-  }
-  $('timeline-title').textContent=`${readTitle} — Seg ${seg}`; 
-  fetchLogData(route,seg); 
+  $('vid-play-btn').style.display='inline-block'; $('vid-play-btn').textContent='Pause'; $('export-btn').style.display='inline-block';
+  $('timeline-title').textContent=`${route} — Seg ${seg}`; fetchLogData(route,seg); window.scrollTo({top:0,behavior:'smooth'});
 }
 
 async function exportWithHud(){
@@ -793,13 +640,13 @@ async function exportWithHud(){
   btn.disabled = true; btn.textContent = 'Exporting...';
   try {
     let r = await fetch(`/export/${currentRoute}--${currentSeg}?cam=${cam}`);
-    if(!r.ok) throw new Error("HTTP " + r.status);
+    if(!r.ok) throw new Error("Export failed");
     let blob = await r.blob();
     let url = URL.createObjectURL(blob);
     let a = document.createElement('a'); a.href = url;
-    a.download = `Comma_Clip_${currentRoute}_${currentSeg}_HUD.mp4`.replace(/[|]/g, '_');
+    a.download = `Comma_Clip_${currentRoute}_${currentSeg}.mp4`.replace(/[|]/g, '_');
     document.body.appendChild(a); a.click(); a.remove();
-  } catch(e) { alert('Export failed'); }
+  } catch(e) { alert('Export failed'); } 
   finally { btn.disabled = false; btn.textContent = 'Export w/ HUD ↓'; }
 }
 
@@ -808,14 +655,15 @@ function seekTimeline(v){if($('player').readyState>=1)$('player').currentTime=+v
 function buildEngagementTrack(){let track=$('engagement-track');track.innerHTML='';if(!logData.length)return;let run=null;logData.forEach((f,i)=>{let e=f[7]===1;if(e&&run===null)run=i;if(!e&&run!==null){let el=document.createElement('div');el.className='engage-segment';el.style.left=(run/logData.length*100)+'%';el.style.width=((i-run)/logData.length*100)+'%';track.appendChild(el);run=null;}});if(run!==null){let el=document.createElement('div');el.className='engage-segment';el.style.left=(run/logData.length*100)+'%';el.style.width=((logData.length-run)/logData.length*100)+'%';track.appendChild(el);}}
 
 $('player').addEventListener('timeupdate', () => {
-  let t=$('player').currentTime||0; if($('timeline-range')) $('timeline-range').value=t; if($('timeline-time')) $('timeline-time').textContent=`${fmtTime(t)} / ${fmtTime($('player').duration)}`;
+  let t=$('player').currentTime||0; $('timeline-range').value=t; $('timeline-time').textContent=`${fmtTime(t)} / ${fmtTime($('player').duration)}`;
   if(!hudActive || logData.length === 0) return;
   let idx=Math.floor(t*10);
   if(idx >= 0 && idx < logData.length){
     let f = logData[idx];
     $('hud-speed').textContent = f[0].toFixed(0);
     $('hud-steer').textContent = f[1].toFixed(1);
-    if($('wheel-hud')) $('wheel-hud').style.transform = `rotate(${(WHEEL_SIGN * f[1]).toFixed(1)}deg)`;
+    let steerPx = Math.max(-50, Math.min(50, (-f[1] / 45.0) * 50));
+    $('steer-ind').style.transform = `translateX(calc(-50% + ${steerPx}px))`;
     $('hud-gas').classList.toggle('active', f[2] === 1);
     $('hud-brake').classList.toggle('active', f[3] === 1);
     $('hud-lead').textContent = f[4] > 0 ? f[4].toFixed(1) : '--';
@@ -825,7 +673,8 @@ $('player').addEventListener('timeupdate', () => {
 });
 
 function follow(v){let h="";for(let i=1;i<8;i++)h+=`<button class="${+v===i?'active':''}" onclick="setv('follow_distance',${i})">${i}</button>`;$("follow").innerHTML=h}
-function sw(id,v){if($(id))$(id).classList.toggle("on",!!v)}
+function sw(id,v){$(id).classList.toggle("on",!!v)}
+function lb(id,l){if(!l||!l.status){$(id).innerHTML="<span>status</span><b>none</b>";return}let a=[["dRel","m"],["yRel","m"],["vRel","m/s"],["vLead","m/s"],["aLeadK","m/s²"],["fcw","fcw"]];$(id).innerHTML=a.map(x=>`<span>${x[0]}</span><b>${typeof l[x[0]]==="number"?l[x[0]].toFixed(2):l[x[0]]??"—"} ${x[1]}</b>`).join("")}
 
 function render(s){
   try {
@@ -833,15 +682,13 @@ function render(s){
     $("status").textContent=s.drive?.active?"ENGAGED":s.drive?.enabled?"READY":"STANDBY";
     $("status").style.color=s.drive?.active?"var(--g)":"var(--m)";
     $("cpu-temp").textContent=Math.round(s.health?.temp||0);
-    if($("health-temp")) $("health-temp").textContent=Math.round(s.health?.temp||0)+"°C";
-    let sp=Number(s.health?.storagePct||0); if($("health-storage")) $("health-storage").textContent=sp?sp.toFixed(0)+"%":"—";
-    let up=Number(s.health?.uptime||0); if($("health-uptime")) $("health-uptime").textContent=up?`${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m`:"—";
-    if($("health-link")) $("health-link").textContent="ONLINE";
+    $("health-temp").textContent=Math.round(s.health?.temp||0)+"°C";
+    let sp=Number(s.health?.storagePct||0); $("health-storage").textContent=sp?sp.toFixed(0)+"%":"—";
+    let up=Number(s.health?.uptime||0); $("health-uptime").textContent=up?`${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m`:"—";
 
     let q=s.settings||{},p=+q.personality_raw;follow(q.follow_distance);
     document.querySelectorAll(".p-btn").forEach(b=>b.classList.toggle("active",+b.dataset.val===p));
-    sw("exp",q.experimental);sw("ada",q.adaptive_accel); sw("spd",q.speed_offset);
-    let trimVal=Number(q.speed_trim||0); if($("trim-display")) $("trim-display").textContent=(trimVal>0?"+":"")+trimVal;
+    sw("exp",q.experimental);sw("ada",q.adaptive_accel); sw("spd",q.speed_offset); sw("aut",q.auto_resume);
     
     let c = s.car || {};
     let pl = s.plan || {};
@@ -851,114 +698,53 @@ function render(s){
     $("speed-val").textContent = Math.round(speedMph);
     
     let maxMph = (+c.vCruise) * 0.621371;
-    let trimHtml = q.speed_trim ? `<span style="font-size:12px;color:var(--m);margin-left:4px">${q.speed_trim>0?"+":""}${q.speed_trim}</span>` : "";
-    $("max-val").innerHTML = maxMph > 5 ? Math.round(maxMph) + trimHtml : "--";
-    
-    let steerDeg = +c.steer || 0;
-    $("steer-val").textContent = Math.round(steerDeg) + "°";
-    if($("wheel-cluster")) $("wheel-cluster").style.transform = `rotate(${(WHEEL_SIGN * steerDeg).toFixed(1)}deg)`;
+    $("max-val").textContent = maxMph > 5 ? Math.round(maxMph) : "--";
+    $("steer-val").textContent = Math.round(c.steer||0) + "°";
 
     $("arr-l").classList.toggle("active", c.leftBlinker);
     $("arr-r").classList.toggle("active", c.rightBlinker);
     $("pedal-brk").classList.toggle("active", c.brakePressed);
     $("pedal-gas").classList.toggle("active", c.gasPressed);
+    
+    $("ego-brake").style.opacity = c.brakePressed ? "1" : "0";
+    $("ego-brake2").style.opacity = c.brakePressed ? "1" : "0";
+    
+    lb("l1", l);
 
-    // Render Battery and Gas
-    let bat = Number(c.batteryPct || 0);
-    if($("ev-battery")) {
-      $("ev-battery").textContent = (bat < 1 && bat > 0 ? (bat*100).toFixed(0) : bat.toFixed(0)) + "%";
-    }
-    let rawGas = Number(c.gasRaw || 0);
-    if($("ev-pedal")) {
-      let dispGas = rawGas > 1.0 ? rawGas : rawGas * 100;
-      $("ev-pedal").textContent = dispGas.toFixed(1) + "%";
-    }
-
-    // SPEED-SYNCED PHYSICS GRID
-    let speedMps = speedMph * 0.44704;
-    let shift = speedMps * 0.15; // Shift based on interval (150ms)
-    gridOffset -= shift;
-    while(gridOffset < 0) gridOffset += 10;
-
-    let gHtml = "";
-    // Draw wide horizontal grid lines
-    for(let i=-6; i<=6; i+=2) {
-      let [bx,by] = project(0, i*1.8);
-      let [tx,ty] = project(60, i*1.8);
-      gHtml += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${tx.toFixed(1)}" y2="${ty.toFixed(1)}" stroke="#1c2a40" stroke-width="1.5"/>`;
-    }
-    // Draw vertically scrolling lines
-    for(let d=gridOffset; d<=60; d+=10) {
-      let [lx,ly] = project(d, -12);
-      let [rx,ry] = project(d, 12);
-      gHtml += `<line x1="${lx.toFixed(1)}" y1="${ly.toFixed(1)}" x2="${rx.toFixed(1)}" y2="${ry.toFixed(1)}" stroke="#1c2a40" stroke-width="1.5"/>`;
-    }
-    if($("grid-lines")) $("grid-lines").innerHTML = gHtml;
-
-    // FAT AI PATH RIBBON
+    // AI Path Math (X:100 is center. Y:280 is ego base. Scale modified for 120m view).
+    let pSvg = "M 100,280 ";
     if(pl.path && pl.path.length > 0) {
-      let leftEdge = [], rightEdge = [], centerLine = [];
       pl.path.forEach(pt => {
-        let [lx, ly] = project(pt[0], -pt[1] + 1.8);
-        let [rx, ry] = project(pt[0], -pt[1] - 1.8);
-        let [cx, cy] = project(pt[0], -pt[1]);
-        leftEdge.push(`${lx.toFixed(1)},${ly.toFixed(1)}`);
-        rightEdge.push(`${rx.toFixed(1)},${ry.toFixed(1)}`);
-        centerLine.push(`${cx.toFixed(1)},${cy.toFixed(1)}`);
+        let py = 280 - (pt[0] * 2.3);
+        let px = 100 + (pt[1] * 6.6); // + because Openpilot lateral is positive to the left
+        pSvg += `L ${px.toFixed(1)},${py.toFixed(1)} `;
       });
-      let polyPts = leftEdge.join(" ") + " " + rightEdge.reverse().join(" ");
-      if($("ai-path")) $("ai-path").setAttribute("points", polyPts);
-      if($("ai-left")) $("ai-left").setAttribute("d", "M " + leftEdge.join(" L "));
-      if($("ai-right")) $("ai-right").setAttribute("d", "M " + rightEdge.reverse().join(" L "));
-      if($("ai-center")) $("ai-center").setAttribute("d", "M " + centerLine.join(" L "));
-      
-      let laneColor = s.drive?.active ? "var(--g)" : "#56b6ff";
-      if($("laneGrad")) {
-        $("laneGrad").children[0].setAttribute("stop-color", laneColor);
-        $("ai-left").setAttribute("stroke", laneColor);
-        $("ai-right").setAttribute("stroke", laneColor);
-        $("ai-center").setAttribute("stroke", laneColor);
-      }
-      
-      let animDur = speedMph > 3 ? Math.max(0.15, 10 / speedMph) : 0;
-      let animStyle = animDur > 0 ? `flow ${animDur}s linear infinite` : "none";
-      if($("ai-center")) $("ai-center").style.animation = animStyle;
-      if($("steer-path")) $("steer-path").style.animation = animStyle;
-
+      $("ai-path").setAttribute("d", pSvg);
+      $("ai-path").setAttribute("stroke", s.drive?.active ? "var(--g)" : "#56b6ff");
     } else {
-      if($("ai-path")) $("ai-path").setAttribute("points", "");
-      if($("ai-left")) $("ai-left").setAttribute("d", "");
-      if($("ai-right")) $("ai-right").setAttribute("d", "");
-      if($("ai-center")) $("ai-center").setAttribute("d", "");
+      $("ai-path").setAttribute("d", "");
     }
-
-    // Kinematic Steer Arcing
-    let tireAngleRad = (steerDeg / 15.0) * (Math.PI / 180.0);
-    let kappa = Math.tan(tireAngleRad) / 2.96;
-    let sSvg = `M ${CLUSTER_CX},${CLUSTER_GROUND_Y} `;
-    for (let d = 3; d <= 40; d += 3) {
-      let lateral = 0.5 * kappa * d * d;
-      let [px, py] = project(d, lateral);
-      sSvg += `L ${px.toFixed(1)},${py.toFixed(1)} `;
-    }
+    
+    // Steering Angle Projection Math
+    let steerCurve = (c.steer || 0) * 2.5; 
+    let sSvg = `M 100,280 Q ${100 + steerCurve/2},220 ${100 + steerCurve},140`;
     $("steer-path").setAttribute("d", sSvg);
 
-    // 3D Lead Tracking Box
+    // Lead Car Math
     let lGrp = $("lead-grp");
     let dist = +l.dRel || 0;
-    let leadBadge = $("lead-badge-val");
     if(l.status && dist > 2.0) {
-      let [lx, ly] = project(dist, +l.yRel || 0);
-      let scale = Math.max(0.3, Math.min(1.5, 18 / (dist + 5)));
+      let lat = +l.yRel || 0;
+      let ly = 280 - (dist * 2.3);
+      let lx = 100 + (lat * 6.6);
+      ly = Math.max(20, Math.min(265, ly));
+      lx = Math.max(20, Math.min(180, lx));
+      let scale = Math.max(0.4, 1.0 - (dist / 120));
       lGrp.style.display = "block";
-      lGrp.style.transform = `translate(${lx.toFixed(1)}px, ${ly.toFixed(1)}px) scale(${scale.toFixed(2)})`;
-      if(leadBadge){
-        leadBadge.textContent = dist.toFixed(0) + "m";
-        leadBadge.style.color = dist < 15 ? "#ff5d67" : dist < 30 ? "#ffb656" : "var(--g)";
-      }
+      lGrp.style.transform = `translate(${lx}px, ${ly}px) scale(${scale})`;
+      $("lead-dist").textContent = dist.toFixed(1) + "m";
     } else {
       lGrp.style.display = "none";
-      if(leadBadge){ leadBadge.textContent = "--"; leadBadge.style.color = "var(--a)"; }
     }
   } catch(e) {}
 }
@@ -981,7 +767,7 @@ async function setv(name,value){
 }
 function toggle(n){setv(n,!S.settings[n])}
 follow(4); get(); setInterval(get, 150);
-</script></div></body></html>"""
+</script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
@@ -992,14 +778,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
     def do_HEAD(self):
         p=urlparse(self.path).path
-        if p.startswith("/stream/") or p.startswith("/download/"):
-            route_seg = p.split("/stream/",1)[1] if p.startswith("/stream/") else p.split("/download/",1)[1]
-            cam=parse_qs(urlparse(self.path).query).get("cam",["qcamera"])[0]
+        if p.startswith("/stream/"):
+            route_seg=p.split("/stream/",1)[1];cam=parse_qs(urlparse(self.path).query).get("cam",["qcamera"])[0]
+            if cam not in ("qcamera","fcamera","dcamera"): return self.send_error(400,"Invalid camera")
             vid=get_mp4_path(route_seg,cam)
             if vid: return serve_file_with_range(self,vid,"video/mp4")
             return self.send_error(404,"Video not found")
         self.send_error(404)
-
     def do_GET(self):
         p = urlparse(self.path).path
         if p in ("/", "/index.html"):
@@ -1017,7 +802,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(get_routes())
         elif p.startswith("/api/log/"):
             route_seg = p.split("/api/log/")[1]
-            cache = f"/dev/shm/rl2_{route_seg}.json"
+            cache = f"/dev/shm/rl_{route_seg}.json"
             if os.path.exists(cache):
                 try:
                     with open(cache, "r") as f:
@@ -1025,7 +810,11 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 except: pass
             s_dir = f"/data/media/0/realdata/{route_seg}"
-            log_p = find_log_path(s_dir)
+            log_p = None
+            for fname in ["rlog.zst", "qlog.zst"]:
+                cand = os.path.join(s_dir, fname)
+                if os.path.exists(cand):
+                    log_p = cand; break
             if not log_p: return self.send_json({"error": "not found"})
             try:
                 tl, en = parse_telemetry_timeline(log_p)
@@ -1038,7 +827,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith("/stream/"):
             route_seg=p.split("/stream/",1)[1]
             cam=parse_qs(urlparse(self.path).query).get("cam",["qcamera"])[0]
-            if cam not in ("qcamera","fcamera","dcamera","ecamera"): return self.send_error(400,"Invalid camera")
+            if cam not in ("qcamera","fcamera","dcamera"): return self.send_error(400,"Invalid camera")
             vid=get_mp4_path(route_seg,cam)
             if vid: serve_file_with_range(self,vid,"video/mp4")
             else: self.send_error(404,"Video not found")
@@ -1046,20 +835,11 @@ class Handler(BaseHTTPRequestHandler):
             route_seg = p.split("/export/")[1]
             cam = parse_qs(urlparse(self.path).query).get("cam", ["qcamera"])[0]
             self.handle_export(route_seg, cam)
-        elif p.startswith("/download/"):
-            route_seg=p.split("/download/",1)[1]
-            cam=parse_qs(urlparse(self.path).query).get("cam",["qcamera"])[0]
-            if cam not in ("qcamera","fcamera","dcamera","ecamera"): return self.send_error(400,"Invalid camera")
-            vid=get_mp4_path(route_seg,cam)
-            if vid: 
-                filename = f"Comma_{route_seg}_{cam}.mp4".replace("|", "_")
-                serve_file_with_range(self,vid,"video/mp4", attachment=filename)
-            else: self.send_error(404,"Video not found")
         else:
             self.send_json({"error": "not found"}, 404)
-
-
+            
     def handle_export(self, route_seg, cam_type):
+        # Export with FFmpeg/ASS instead of pushing raw frames through Python.
         src_path = get_mp4_path(route_seg, cam_type)
         if not src_path: return self.send_json({"error": "no video"}, 404)
         seg_dir = f"/data/media/0/realdata/{route_seg}"
@@ -1067,76 +847,60 @@ class Handler(BaseHTTPRequestHandler):
         if not log_path: return self.send_json({"error": "no telemetry log"}, 404)
         out_path = f"/dev/shm/exp_{route_seg}_{cam_type}.mp4"
         ass_path = f"/dev/shm/hud_{route_seg}_{cam_type}.ass"
-        
-        ff_cmd = get_ffmpeg_cmd()
-        
         try:
-            tl, en = parse_telemetry_timeline(log_path)
-            if not tl: return self.send_json({"error": "no telemetry"}, 422)
-            
-            def ass_time(sec):
-                sec=max(0.0,float(sec)); whole=int(sec); cs=int(round((sec-whole)*100))
-                if cs>=100: whole+=1; cs=0
-                return f"{whole//3600}:{(whole%3600)//60:02d}:{whole%60:02d}.{cs:02d}"
-            
-            # Modern, clean Box layouts (BorderStyle 3 creates a sleek semi-transparent box)
-            styles = '''[Script Info]
+            if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+                tl, en = parse_telemetry_timeline(log_path)
+                if not tl: return self.send_json({"error": "no telemetry"}, 422)
+                def ass_time(sec):
+                    sec=max(0.0,float(sec)); whole=int(sec); cs=int(round((sec-whole)*100))
+                    if cs>=100: whole+=1; cs=0
+                    return f"{whole//3600}:{(whole%3600)//60:02d}:{whole%60:02d}.{cs:02d}"
+                def ass_escape(text): return str(text).replace("\\","\\\\").replace("{","\\{").replace("}","\\}")
+                styles = """[Script Info]
 ScriptType: v4.00+
-PlayResX: 1280
-PlayResY: 720
+PlayResX: 1928
+PlayResY: 1208
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TopBox,Arial,28,&H00FFFFFF,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,8,0,0,20,1
-Style: SpdBox,Arial,48,&H00FFFFFF,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,2,0,0,20,1
-Style: SideBox,Arial,24,&H00FFFFFF,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,1,20,20,20,1
-Style: SideBoxR,Arial,24,&H00FFFFFF,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,3,20,20,20,1
-Style: PedalR,Arial,24,&H003B3BFF,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,2,0,140,90,1
-Style: PedalG,Arial,24,&H005DE37E,&H00000000,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,2,0,2,140,0,90,1
-'''
-            lines=[]
-            for i,fr in enumerate(tl[:600]):
-                a,b = ass_time(i/10), ass_time((i+1)/10)
-                state = "{\\c&H5DE37E&}ENGAGED" if (i<len(en) and en[i]) else "{\\c&HAAAAAA&}STANDBY"
-                lines.append(f"Dialogue: 0,{a},{b},TopBox,,0,0,0,,{state}")
-                lines.append(f"Dialogue: 1,{a},{b},SpdBox,,0,0,0,,{fr[0]:.0f} MPH")
-                
-                lead_txt = f"LEAD: {fr[4]:.1f}m" if fr[4]>0 else "LEAD: --"
-                lines.append(f"Dialogue: 1,{a},{b},SideBox,,0,0,0,,{lead_txt}")
-                lines.append(f"Dialogue: 1,{a},{b},SideBoxR,,0,0,0,,STR: {fr[1]:+.1f}°")
-                
-                if fr[3]: lines.append(f"Dialogue: 2,{a},{b},PedalR,,0,0,0,,BRAKE")
-                if fr[2]: lines.append(f"Dialogue: 2,{a},{b},PedalG,,0,0,0,,GAS")
-            
-            with open(ass_path, "w", encoding="utf-8") as f:
-                f.write(styles + "\n".join(lines) + "\n")
-            
-            cmd=[ff_cmd, "-y", "-hide_banner", "-loglevel", "error", "-i", src_path]
-            
-            qcam_file = f"/data/media/0/realdata/{route_seg}/qcamera.ts"
-            has_audio = (cam_type != "qcamera" and os.path.exists(qcam_file))
-            if has_audio: cmd.extend(["-i", qcam_file])
-                
-            cmd.extend(["-vf", f"ass={ass_path}"])
-            
-            if has_audio: cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
-            else: cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
-                
-            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-c:a", "copy", "-tag:v", "hvc1", "-movflags", "+faststart", out_path])
-            
-            proc=subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0 or not os.path.exists(out_path):
-                return self.send_json({"error":"ffmpeg export failed", "detail":proc.stderr[-500:]},500)
-            
-            serve_file_with_range(self, out_path, "video/mp4", f"Comma_Clip_{route_seg}_{cam_type}_HUD.mp4")
-            
+Style: State,Arial,34,&H00FFFFFF,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,2,30,30,30,1
+Style: Speed,Arial,72,&H00FFFFFF,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,3,3,2,30,30,70,1
+Style: Lead,Arial,36,&H00FFB656,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,8,30,30,50,1
+Style: Steer,Arial,30,&H00FFFFFF,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,1,30,30,55,1
+Style: Brake,Arial,34,&H003B3BFF,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,3,30,30,60,1
+Style: Gas,Arial,34,&H0034C759,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,3,30,30,120,1
+Style: Arrow,Arial,44,&H0034C759,&H00000000,&H99000000,&H99000000,1,0,0,0,100,100,0,0,1,2,2,5,30,30,55,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+                lines=[]
+                for i,fr in enumerate(tl[:600]):
+                    a,b=ass_time(i/10),ass_time((i+1)/10)
+                    state="ENGAGED" if (i<len(en) and en[i]) else "STANDBY"
+                    lines.append(f"Dialogue: 0,{a},{b},State,,0,0,0,,{ass_escape(state)}")
+                    lines.append(f"Dialogue: 1,{a},{b},Speed,,0,0,0,,{ass_escape(f'{fr[0]:.0f} MPH')}")
+                    lines.append(f"Dialogue: 1,{a},{b},Lead,,0,0,0,,{ass_escape(f'LEAD {fr[4]:.1f} M' if fr[4]>0 else 'LEAD --')}")
+                    lines.append(f"Dialogue: 1,{a},{b},Steer,,0,0,0,,{ass_escape(f'STR {fr[1]:+.1f}°')}")
+                    if fr[3]: lines.append(f"Dialogue: 2,{a},{b},Brake,,0,0,0,,BRAKE")
+                    if fr[2]: lines.append(f"Dialogue: 2,{a},{b},Gas,,0,0,0,,GAS")
+                    if fr[5]: lines.append(f"Dialogue: 2,{a},{b},Arrow,,0,0,0,,◀")
+                    if fr[6]: lines.append(f"Dialogue: 2,{a},{b},Arrow,,0,0,0,,▶")
+                Path(ass_path).write_text(styles+"\n".join(lines)+"\n", encoding="utf-8")
+                cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src_path,"-vf",f"ass={ass_path}","-map","0:v:0","-map","0:a?","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p","-c:a","copy","-movflags","+faststart",out_path]
+                proc=subprocess.run(cmd,capture_output=True,text=True,timeout=180)
+                if proc.returncode!=0 or not os.path.exists(out_path):
+                    return self.send_json({"error":"ffmpeg export failed","detail":proc.stderr[-1200:]},500)
+            serve_file_with_range(self,out_path,"video/mp4",f"Comma_Clip_{route_seg}_{cam_type}.mp4")
+        except subprocess.TimeoutExpired:
+            self.send_json({"error":"export timed out"},504)
         except Exception as e:
             self.send_json({"error":f"export failed: {e}"},500)
         finally:
             try:
                 if os.path.exists(ass_path): os.unlink(ass_path)
-            except: pass
+            except Exception: pass
 
     def do_POST(self):
         if urlparse(self.path).path != "/api/set":
