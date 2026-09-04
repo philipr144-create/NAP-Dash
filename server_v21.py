@@ -143,8 +143,8 @@ def lead_dict(lead):
 class HistoryDatabase:
     """Bounded SQLite history with non-blocking telemetry writes and diagnostics."""
     LIMITS = {
-        "performance": 500, "regen": 500, "battery": 30000,
-        "efficiency": 500, "charging": 100, "settings": 1000,
+        "performance": 5000, "regen": 10000, "battery": 150000,
+        "efficiency": 10000, "charging": 5000, "settings": 5000,
     }
     LEGACY = {
         "performance": "performance_runs.jsonl",
@@ -426,6 +426,7 @@ def enrich_run_history(runs, snapshots):
 
 
 class TelemetryRecorder:
+    SESSION_RESUME_MAX_AGE_S = 6 * 3600
     DRAG_SPEEDS = (10, 20, 30, 40, 50, 60, 70, 80, 100)
     ROLLS = ((20, 60), (30, 70), (40, 80), (50, 100), (60, 100))
     BRAKES = (40, 50, 60)
@@ -473,13 +474,29 @@ class TelemetryRecorder:
         for key, store in (("trip", TRIP_STORE), ("charge", CHARGE_STORE)):
             row = interrupted.get(key) if isinstance(interrupted, dict) else None
             if isinstance(row, dict) and row.get("started_at"):
-                row.update({"ended_at": time.time(), "interrupted": True})
-                if key == "trip":
-                    miles = num(row.get("distance_m")) * .000621371
-                    row["distance_mi"] = round(miles, 2)
-                    row["wh_per_mi"] = round(num(row.get("energy_kwh")) * 1000 / miles, 1) if miles > .05 else None
-                store.append(row)
-        HISTORY_DB.save_state("active_sessions", {})
+                age = max(0.0, time.time() - num(row.get("checkpoint_at"), row.get("started_at")))
+                if age <= self.SESSION_RESUME_MAX_AGE_S:
+                    elapsed = max(0.0, num(row.pop("elapsed_active_s", 0)))
+                    row.pop("checkpoint_at", None)
+                    row["start_time"] = time.monotonic() - elapsed
+                    row["start_mono"] = row["start_time"]
+                    if key == "trip":
+                        row["last_move_mono"] = time.monotonic()
+                        self.trip = row
+                    else:
+                        row["last_charge_mono"] = time.monotonic()
+                        row["last_curve_mono"] = 0.0
+                        self.charge = row
+                else:
+                    row.pop("checkpoint_at", None)
+                    row.pop("elapsed_active_s", None)
+                    row.update({"ended_at": time.time(), "interrupted": True})
+                    if key == "trip":
+                        miles = num(row.get("distance_m")) * .000621371
+                        row["distance_mi"] = round(miles, 2)
+                        row["wh_per_mi"] = round(num(row.get("energy_kwh")) * 1000 / miles, 1) if miles > .05 else None
+                    store.append(row)
+        self._save_active_sessions()
 
     def _base(self, kind, now, sample):
         run = {
@@ -521,6 +538,8 @@ class TelemetryRecorder:
         out.update(extra or {})
         out["duration_s"] = round(max(0, finished_mono - start), 3)
         out["completed_at"] = time.time()
+        low, high = out.get("min_pack_voltage_v"), out.get("max_pack_voltage_v")
+        out["voltage_sag_v"] = round(max(0.0, num(high) - num(low)), 1) if low is not None and high is not None else None
         if sample is not None:
             out["ending_conditions"] = pack_conditions(sample)
         self.last_run = json.loads(json.dumps(out))
@@ -534,6 +553,20 @@ class TelemetryRecorder:
         for key in ("start_mono", "start_time", "last_regen_mono", "last_move_mono", "last_charge_mono", "last_curve_mono"):
             out.pop(key, None)
         return out
+
+    def _checkpoint_session(self, value):
+        out = self._public_session(value)
+        if out and value:
+            started = num(value.get("start_time"), time.monotonic())
+            out["elapsed_active_s"] = round(max(0.0, time.monotonic() - started), 1)
+            out["checkpoint_at"] = time.time()
+        return out
+
+    def _save_active_sessions(self):
+        HISTORY_DB.save_state("active_sessions", {
+            "trip": self._checkpoint_session(self.trip),
+            "charge": self._checkpoint_session(self.charge),
+        })
 
     def sample(self, now, sample):
         speed = max(0.0, num(sample.get("car", {}).get("vEgo")))
@@ -695,7 +728,7 @@ class TelemetryRecorder:
 
         if now - self.last_checkpoint >= 30:
             HISTORY_DB.save_state("trip_meters", self.trip_meters)
-            HISTORY_DB.save_state("active_sessions", {"trip": self._public_session(self.trip), "charge": self._public_session(self.charge)})
+            self._save_active_sessions()
             self.last_checkpoint = now
 
     def _finish_trip(self, now):
@@ -780,7 +813,7 @@ class TelemetryRecorder:
             "resting": abs(power_kw) < 2 and speed < .2,
         })
         self.last_health_sample = now
-        if now - self.last_snapshot < 300:
+        if now - self.last_snapshot < 60:
             return
         rows, resistances = self.health_window, self.health_resistance
         valid = lambda key: [num(row[key]) for row in rows if row.get(key) is not None]
@@ -857,7 +890,7 @@ class TelemetryRecorder:
     def checkpoint(self):
         with self.lock:
             HISTORY_DB.save_state("trip_meters", self.trip_meters)
-            HISTORY_DB.save_state("active_sessions", {"trip": self._public_session(self.trip), "charge": self._public_session(self.charge)})
+            self._save_active_sessions()
             if self.segment_name and self.segment_points:
                 HISTORY_DB.save_segment(self.segment_name, {"schema": 1, "points": self.segment_points})
 
@@ -911,6 +944,15 @@ def battery_health_report(days=30):
         if idx is not None:
             weakest_counts[str(idx)] = weakest_counts.get(str(idx), 0) + 1
     weakest = max(weakest_counts, key=weakest_counts.get) if weakest_counts else None
+    trend = [{"t": row.get("recorded_at"), "capacity": row.get("nom_full_kwh"), "resistance": row.get("resistance_mohm"), "spread": row.get("cell_spread_mv"), "sag": row.get("voltage_sag_v"), "temp": row.get("pack_temp_c")} for row in rows]
+    live_bms = STATE.get("bms", {})
+    live_cells = [num(v) for v in live_bms.get("bricks", []) if 2000 < num(v) < 5000]
+    if live and (not trend or time.time() - num(trend[-1].get("t")) > 10):
+        trend.append({
+            "t": time.time(), "capacity": live, "resistance": None,
+            "spread": round(max(live_cells) - min(live_cells), 1) if live_cells else None,
+            "sag": None, "temp": num(live_bms.get("max_t")) or None, "live": True,
+        })
     return {
         "days": days, "sample_count": len(rows), "qualified_sample_count": len(qualified),
         "confidence": "high" if points >= 100 else "medium" if points >= 30 else "learning",
@@ -927,7 +969,7 @@ def battery_health_report(days=30):
         "weakest_brick": safe_int(weakest, -1) if weakest is not None else None,
         "peak_discharge_kw": round(max(values("peak_discharge_kw") or [0]), 1),
         "peak_regen_kw": round(max(values("peak_regen_kw") or [0]), 1),
-        "trend": [{"t": row.get("recorded_at"), "capacity": row.get("nom_full_kwh"), "resistance": row.get("resistance_mohm"), "spread": row.get("cell_spread_mv"), "sag": row.get("voltage_sag_v"), "temp": row.get("pack_temp_c")} for row in rows],
+        "trend": trend,
     }
 
 
@@ -946,8 +988,13 @@ def history_payload(kind="all", limit=100, days=0):
 
 
 def history_summary(days=30):
-    since = time.time() - max(1, safe_int(days, 30)) * 86400
-    trips = TRIP_STORE.read(500, since)
+    now = time.time()
+    since = now - max(1, safe_int(days, 30)) * 86400
+    # Automatic trips are the canonical odometer-like efficiency history. Manual
+    # trip-meter snapshots remain browsable but are excluded here to avoid counting
+    # the same driving twice.
+    all_trips = [row for row in TRIP_STORE.read(10000) if row.get("kind") != "trip_meter"]
+    trips = [row for row in all_trips if HistoryDatabase._created(row) >= since]
     regen = REGEN_STORE.read(500, since)
     charging = CHARGE_STORE.read(100, since)
     runs = RUN_STORE.read(500, since)
@@ -957,6 +1004,40 @@ def history_summary(days=30):
     regen_event_kwh = sum(num(row.get("energy_recovered_kwh")) for row in regen)
     charge_kwh = sum(num(row.get("energy_added_kwh")) for row in charging)
     weighted_wh = (net_kwh * 1000 / trip_miles) if trip_miles > .05 else None
+    def efficiency_period(period_rows):
+        miles = sum(num(row.get("distance_mi")) for row in period_rows)
+        net = sum(num(row.get("energy_kwh", row.get("net_kwh"))) for row in period_rows)
+        regen_kwh = sum(num(row.get("regen_kwh")) for row in period_rows)
+        return {
+            "trips": len(period_rows), "miles": round(miles, 1), "net_kwh": round(net, 2),
+            "regen_kwh": round(regen_kwh, 2),
+            "wh_per_mi": round(net * 1000 / miles) if miles > .05 else None,
+        }
+    local = time.localtime(now)
+    today_start = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, local.tm_isdst))
+    period_specs = (("today", today_start), ("7d", now - 7 * 86400), ("30d", now - 30 * 86400))
+    periods = {name: efficiency_period([row for row in all_trips if HistoryDatabase._created(row) >= start]) for name, start in period_specs}
+    periods["all"] = efficiency_period(all_trips)
+    daily = {}
+    for row in all_trips:
+        created = HistoryDatabase._created(row)
+        if created < now - 30 * 86400:
+            continue
+        day = time.strftime("%Y-%m-%d", time.localtime(created))
+        bucket = daily.setdefault(day, {"miles": 0.0, "net_kwh": 0.0, "regen_kwh": 0.0, "trips": 0})
+        bucket["miles"] += num(row.get("distance_mi"))
+        bucket["net_kwh"] += num(row.get("energy_kwh", row.get("net_kwh")))
+        bucket["regen_kwh"] += num(row.get("regen_kwh"))
+        bucket["trips"] += 1
+    daily_rows = []
+    for day in sorted(daily):
+        bucket = daily[day]
+        bucket["day"] = day
+        bucket["miles"] = round(bucket["miles"], 1)
+        bucket["net_kwh"] = round(bucket["net_kwh"], 2)
+        bucket["regen_kwh"] = round(bucket["regen_kwh"], 2)
+        bucket["wh_per_mi"] = round(bucket["net_kwh"] * 1000 / bucket["miles"]) if bucket["miles"] > .05 else None
+        daily_rows.append(bucket)
     return {
         "days": max(1, safe_int(days, 30)), "trip_count": len(trips),
         "distance_mi": round(trip_miles, 1), "net_kwh": round(net_kwh, 2),
@@ -965,6 +1046,7 @@ def history_summary(days=30):
         "average_wh_per_mi": round(weighted_wh, 0) if weighted_wh is not None else None,
         "performance_runs": len(runs), "database": HISTORY_DB.stats(),
         "recorder": RECORDER.diagnostics(),
+        "efficiency_periods": periods, "daily_efficiency": daily_rows,
     }
 
 
@@ -2622,7 +2704,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#090909">
-<title>NAP Telemetry</title>
+<title>NAP Telemetry v24</title>
 <style>
 :root{color-scheme:dark;--bg:#070706;--surface:#10100f;--surface2:#171715;--line:#2b2a27;--text:#f4f1e8;--muted:#a5a095;--amber:#f4a641;--amber2:#ffcc80;--cyan:#55d6d1;--green:#70d68b;--red:#ff6f69;--blue:#79b8ff;--purple:#b997ff;--radius:18px}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:linear-gradient(120deg,#070706,#0d0c09 55%,#070706);color:var(--text);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:16px;line-height:1.35}.shell{max-width:1280px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;padding:6px 2px 18px}.brand{font-size:1.6rem;font-weight:900;letter-spacing:-.04em}.brand span{color:var(--amber)}.eyebrow{color:var(--muted);font-size:.75rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;margin-bottom:4px}.connection{text-align:right;color:var(--muted);font-size:.82rem}.connection b{color:var(--green)}
@@ -2630,14 +2712,14 @@ DASHBOARD_HTML = r"""<!doctype html>
 .card{background:linear-gradient(145deg,#151513,#0d0d0c);border:1px solid var(--line);border-radius:var(--radius);padding:17px;min-width:0}.card.amber{background:linear-gradient(145deg,#2a1c0d,#15110c);border-color:#59401f}.card.cyan{background:linear-gradient(145deg,#0c2221,#0d1211);border-color:#214b49}.label{color:var(--muted);font-size:.76rem;font-weight:850;letter-spacing:.12em;text-transform:uppercase}.value{font-size:2rem;line-height:1;font-weight:900;letter-spacing:-.045em;margin-top:10px}.value.huge{font-size:4.8rem}.sub{color:var(--muted);font-size:.82rem;margin-top:8px}.accent{color:var(--amber)}.cyan-text{color:var(--cyan)}.good{color:var(--green)}.bad{color:var(--red)}.rule{height:1px;background:var(--line);margin:15px 0}.statusline{display:flex;align-items:center;gap:9px;font-weight:850}.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}.dot.good{background:var(--green);box-shadow:0 0 12px #70d68b88}.dot.bad{background:var(--red);box-shadow:0 0 12px #ff6f6966}.metric-row{display:flex;justify-content:space-between;align-items:baseline;gap:14px;padding:9px 0;border-bottom:1px solid #24231f}.metric-row:last-child{border:0}.metric-row span{color:var(--muted);font-size:.88rem}.metric-row b{text-align:right}.pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.75rem;font-weight:800}.pill.live{color:var(--green);border-color:#2e6d3d;background:#0d2514}.count-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.count{background:#0b0b0a;border:1px solid #24231f;border-radius:12px;padding:12px}.count b{font-size:1.35rem;display:block}.count span{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 .power-track{display:grid;grid-template-columns:1fr 2px 1fr;height:17px;border-radius:9px;overflow:hidden;background:#22211e;margin-top:16px}.power-zero{background:#f4f1e8}.power-side{position:relative}.power-fill{position:absolute;top:0;bottom:0;width:0;transition:width .25s}.power-side.regen .power-fill{right:0;background:var(--cyan)}.power-side.drive .power-fill{left:0;background:var(--amber)}.bricks{display:grid;grid-template-columns:repeat(16,1fr);gap:5px;margin-top:14px}.brick{aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:5px;background:#22211f;color:#fff;font:700 .68rem ui-monospace,monospace}.brick.low{background:#a83f3b}.brick.high{background:#286a75}.brick.ok{background:#287340}.brick.none{color:#69665e;background:#161513}
 .controls{display:flex;gap:8px;flex-wrap:wrap}.button,.choice,select{border:1px solid #393732;background:#1b1a18;color:var(--text);border-radius:11px;padding:11px 13px;font:inherit;font-size:.85rem;font-weight:800;cursor:pointer}.button:hover,.choice:hover{border-color:#6b6459}.button.primary,.choice.active{background:var(--amber);border-color:var(--amber);color:#181006}.button.danger{color:var(--red)}.choice{flex:1}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:13px 0;border-bottom:1px solid var(--line)}.switch-row:last-child{border:0}.switch{width:52px;height:29px;border:0;border-radius:16px;background:#3a3833;position:relative;cursor:pointer;flex:none}.switch i{position:absolute;top:3px;left:3px;width:23px;height:23px;background:#f8f6ef;border-radius:50%;transition:left .15s}.switch.on{background:var(--green)}.switch.on i{left:26px}.follow{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:10px}.follow .choice{padding:10px 2px}
-.chart{width:100%;height:190px;background:#090908;border:1px solid #24231f;border-radius:12px;margin-top:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}.filters .button.active{background:var(--amber);border-color:var(--amber);color:#181006}.history-list{margin-top:12px}.history-item{display:grid;grid-template-columns:9rem 1fr auto;gap:14px;align-items:center;padding:14px 2px;border-bottom:1px solid var(--line)}.history-item:last-child{border:0}.history-kind{color:var(--amber);font-size:.74rem;font-weight:900;letter-spacing:.1em;text-transform:uppercase}.history-title{font-weight:850}.history-meta{color:var(--muted);font-size:.78rem;margin-top:4px}.history-result{font-size:1.05rem;font-weight:900;text-align:right}.empty{padding:32px 12px;text-align:center;color:var(--muted)}.diag{font:500 .78rem ui-monospace,monospace;color:var(--muted);word-break:break-word}
-.video-wrap{position:relative;aspect-ratio:16/9;background:#000;border:1px solid var(--line);border-radius:16px;overflow:hidden}video{width:100%;height:100%}.hud{display:none;position:absolute;inset:0;pointer-events:none;padding:16px;justify-content:space-between;flex-direction:column;background:linear-gradient(#0008,transparent 28%,transparent 72%,#0009)}.hud.on{display:flex}.hud-row{display:flex;justify-content:space-between;align-items:center;gap:10px}.hud-box{padding:8px 12px;border-radius:9px;background:#050505b8;border:1px solid #ffffff30;font-weight:900}.timeline{width:100%;accent-color:var(--amber)}.routes{margin-top:12px}.route{padding:14px 0;border-bottom:1px solid var(--line)}.segments{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.segment{padding:8px 10px}.segment.playing{background:var(--amber);color:#181006}.toast{position:fixed;right:20px;bottom:20px;z-index:50;padding:11px 15px;border-radius:12px;background:#211b11;border:1px solid #765526;color:var(--amber2);opacity:0;transform:translateY(12px);transition:.2s}.toast.on{opacity:1;transform:translateY(0)}
+.chart{width:100%;height:190px;background:#090908;border:1px solid #24231f;border-radius:12px;margin-top:12px}.chart.tall{height:280px}.chart-key{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;color:var(--muted);font-size:.76rem}.chart-key i{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px}.battery-title{display:flex;align-items:center;gap:15px}.battery-icon{width:78px;flex:none;filter:drop-shadow(0 0 14px #55d6d144)}.filters{display:flex;gap:8px;flex-wrap:wrap}.filters .button.active{background:var(--amber);border-color:var(--amber);color:#181006}.history-list{margin-top:12px}.history-item{display:grid;grid-template-columns:9rem 1fr auto;gap:14px;align-items:center;padding:14px 9px;border-bottom:1px solid var(--line);border-radius:10px;cursor:pointer;transition:.15s}.history-item:hover,.history-item:active{background:#211c13;transform:translateX(2px)}.history-kind{color:var(--amber);font-size:.74rem;font-weight:900;letter-spacing:.1em;text-transform:uppercase}.history-title{font-weight:850}.history-meta{color:var(--muted);font-size:.78rem;margin-top:4px}.history-result{font-size:1.05rem;font-weight:900;text-align:right}.empty{padding:32px 12px;text-align:center;color:var(--muted)}.diag{font:500 .78rem ui-monospace,monospace;color:var(--muted);word-break:break-word}.detail-backdrop{display:none;position:fixed;inset:0;z-index:80;background:#000b;padding:18px;overflow:auto}.detail-backdrop.open{display:flex;align-items:flex-end;justify-content:center}.detail-sheet{width:min(780px,100%);max-height:92vh;overflow:auto;background:linear-gradient(145deg,#1b1915,#0c0c0b);border:1px solid #5b4930;border-radius:22px 22px 10px 10px;padding:20px;box-shadow:0 -20px 80px #000}.detail-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:15px}.detail-stat{background:#0a0a09;border:1px solid #2a2823;border-radius:12px;padding:12px}.detail-stat b{display:block;font-size:1.15rem}.detail-stat span{display:block;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;margin-top:4px}.milestone-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}.periods{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:14px}.period{padding:13px;border:1px solid #312e28;border-radius:13px;background:#0a0a09}.period b{font-size:1.25rem}.period span{display:block;color:var(--muted);font-size:.73rem;margin-top:3px}
+.video-wrap{position:relative;aspect-ratio:16/9;background:#000;border:1px solid var(--line);border-radius:16px;overflow:hidden}video{width:100%;height:100%}.phone-frame{width:100%;height:760px;border:1px solid var(--line);border-radius:18px;background:#05070a}.hud{display:none;position:absolute;inset:0;pointer-events:none;padding:16px;justify-content:space-between;flex-direction:column;background:linear-gradient(#0008,transparent 28%,transparent 72%,#0009)}.hud.on{display:flex}.hud-row{display:flex;justify-content:space-between;align-items:center;gap:10px}.hud-box{padding:8px 12px;border-radius:9px;background:#050505b8;border:1px solid #ffffff30;font-weight:900}.timeline{width:100%;accent-color:var(--amber)}.routes{margin-top:12px}.route{padding:14px 0;border-bottom:1px solid var(--line)}.segments{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.segment{padding:8px 10px}.segment.playing{background:var(--amber);color:#181006}.toast{position:fixed;right:20px;bottom:20px;z-index:50;padding:11px 15px;border-radius:12px;background:#211b11;border:1px solid #765526;color:var(--amber2);opacity:0;transform:translateY(12px);transition:.2s}.toast.on{opacity:1;transform:translateY(0)}
 @media(max-width:900px){.span3,.span4{grid-column:span 6}.span5,.span6,.span7,.span8{grid-column:span 12}}
-@media(max-width:600px){.shell{padding:10px}.top{padding:7px 3px 13px}.brand{font-size:1.35rem}.connection span{display:none}.span3,.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 12}.value{font-size:1.8rem}.value.huge{font-size:3.9rem}.bricks{grid-template-columns:repeat(12,1fr);gap:3px}.brick{font-size:.55rem}.history-item{grid-template-columns:1fr auto}.history-kind{grid-column:1/-1}.count-grid{grid-template-columns:repeat(2,1fr)}.tabs button{min-width:94px}}
+@media(max-width:600px){.shell{padding:10px}.top{padding:7px 3px 13px}.brand{font-size:1.35rem}.connection span{display:none}.span3,.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 12}.value{font-size:1.8rem}.value.huge{font-size:3.9rem}.bricks{grid-template-columns:repeat(12,1fr);gap:3px}.brick{font-size:.55rem}.history-item{grid-template-columns:1fr auto}.history-kind{grid-column:1/-1}.count-grid{grid-template-columns:repeat(2,1fr)}.tabs button{min-width:94px}.periods{grid-template-columns:repeat(2,1fr)}.detail-grid,.milestone-grid{grid-template-columns:repeat(2,1fr)}.detail-backdrop{padding:8px}.battery-icon{width:62px}}
 </style></head><body><div class="shell">
 <header class="top"><div><div class="eyebrow">Not Auto Pilot</div><div class="brand">NAP <span>Telemetry</span></div></div><div class="connection"><span>LOW-BANDWIDTH CONSOLE · </span><b id="top-status">CONNECTING</b><div id="top-age">Waiting for comma</div></div></header>
 <nav class="tabs" aria-label="Dashboard sections">
- <button class="active" data-tab="overview">Overview</button><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="settings">Settings</button>
+ <button class="active" data-tab="overview">Home</button><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="phone">Phone</button>
 </nav>
 
 <main>
@@ -2652,11 +2734,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <section id="page-battery" class="page"><div class="grid">
  <article class="card cyan span5"><div class="label">Pack power</div><div class="value"><span id="bms-kw">0.0</span> kW</div><div class="sub"><span id="bms-pack-v">0.0</span> V · <span id="bms-pack-i">0.0</span> A</div><div class="power-track"><div class="power-side regen"><i id="bms-regen-bar" class="power-fill"></i></div><i class="power-zero"></i><div class="power-side drive"><i id="bms-drive-bar" class="power-fill"></i></div></div><div class="sub"><span id="bms-max-regen">0</span> kW regen available · <span id="bms-max-drive">0</span> kW discharge available</div></article>
- <article class="card span7"><div class="label">Energy state</div><div class="grid" style="margin-top:8px"><div class="span4"><div class="value" id="bms-display-soc">--%</div><div class="sub">Usable SOC</div></div><div class="span4"><div class="value" id="bms-nom-full">--</div><div class="sub">Nominal full kWh</div></div><div class="span4"><div class="value" id="bms-range">--</div><div class="sub">Rated miles</div></div></div></article>
+ <article class="card span7"><div class="battery-title"><svg class="battery-icon" viewBox="0 0 120 64" aria-hidden="true"><defs><linearGradient id="batteryGlow" x1="0" x2="1"><stop stop-color="#55d6d1"/><stop offset="1" stop-color="#70d68b"/></linearGradient></defs><rect x="4" y="8" width="101" height="48" rx="11" fill="none" stroke="#8b8982" stroke-width="5"/><path d="M108 24h8v16h-8" fill="none" stroke="#8b8982" stroke-width="6" stroke-linecap="round"/><rect id="battery-fill" x="11" y="15" width="0" height="34" rx="6" fill="url(#batteryGlow)"/></svg><div><div class="label">Energy state</div><div class="sub">Decoded BMS energy, not an estimated placeholder</div></div></div><div class="grid" style="margin-top:12px"><div class="span4"><div class="value" id="bms-display-soc">--%</div><div class="sub">Usable SOC</div></div><div class="span4"><div class="value" id="bms-nom-full">--</div><div class="sub">Nominal full kWh</div></div><div class="span4"><div class="value" id="bms-range">--</div><div class="sub">Rated miles</div></div></div></article>
  <article class="card span6"><div class="label">BMS energy registers</div><div id="bms-energy-kv"></div></article>
  <article class="card span6"><div class="label">Thermal & balance</div><div id="bms-health-kv"></div></article>
  <article class="card span12"><div style="display:flex;justify-content:space-between;gap:10px"><div class="label">96 brick voltages</div><div id="brick-average" class="pill">AVG --</div></div><div id="brick-grid" class="bricks"></div><div class="sub">Red is more than 10 mV below pack average · blue is more than 10 mV above · green is within band.</div></article>
- <article class="card span12"><div class="controls" style="justify-content:space-between"><div><div class="label">Battery health trend</div><div id="battery-confidence" class="sub">Learning from five-minute samples</div></div><div class="controls"><button class="button health-days" data-days="7">7D</button><button class="button health-days active" data-days="30">30D</button><button class="button health-days" data-days="90">90D</button></div></div><div class="count-grid" id="battery-health-counts"></div><canvas id="battery-health-chart" class="chart" width="1000" height="220"></canvas></article>
+ <article class="card span12"><div class="controls" style="justify-content:space-between"><div><div class="label">Battery health trend</div><div id="battery-confidence" class="sub">Saving once per minute and refreshing live</div></div><div class="controls"><button class="button health-days" data-days="7">7D</button><button class="button health-days active" data-days="30">30D</button><button class="button health-days" data-days="90">90D</button></div></div><div class="count-grid" id="battery-health-counts"></div><canvas id="battery-health-chart" class="chart tall" width="1000" height="300"></canvas><div class="chart-key"><span><i style="background:#79b8ff"></i>Nominal capacity</span><span><i style="background:#ff6f69"></i>Voltage sag</span><span><i style="background:#f4a641"></i>Cell spread</span></div><div class="sub">Capacity changes slowly and only when the BMS reports a new value. Sag and cell spread vary with load, SOC and temperature; tap their saved records in History for context.</div></article>
 </div></section>
 
 <section id="page-energy" class="page"><div class="grid">
@@ -2669,11 +2751,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 <section id="page-performance" class="page"><div class="grid">
  <article class="card amber span5" style="text-align:center"><div id="perf-chip" class="pill">READY</div><div class="value huge" id="perf-speed">0</div><div class="label">MPH</div><div class="value" style="font-size:1.5rem"><span id="perf-g">0.000</span> G</div><div id="perf-last" class="sub">Automatic recording remains active on the comma.</div></article>
  <article class="card span7"><div class="label">Automatic milestones</div><div id="perf-milestones" class="count-grid"></div><div class="rule"></div><div class="sub">Standing: 0–10 through 0–100, ⅛ and ¼ mile · Rolls: 20–60, 30–70, 40–80, 50–100, 60–100 · Braking: 40/50/60–0.</div></article>
- <article class="card span12"><div class="label">Saved runs</div><div id="performance-history" class="history-list"><div class="empty">Loading runs…</div></div></article>
+ <article class="card span12"><div class="label">Saved runs</div><div class="sub">Tap any event to inspect pack voltage, voltage sag, power, current, temperature, SOC and cell balance.</div><div id="performance-history" class="history-list"><div class="empty">Loading runs…</div></div></article>
 </div></section>
 
 <section id="page-history" class="page"><div class="grid">
- <article class="card span12"><div class="controls" style="justify-content:space-between"><div><div class="label">History explorer</div><div class="sub">Read every recorder directly from SQLite. Empty now means empty on disk—not hidden by the interface.</div></div><div class="controls"><button class="button" onclick="exportHistory('json')">JSON</button><button class="button" onclick="exportHistory('csv')">CSV</button><button class="button primary" onclick="loadHistory()">Refresh</button></div></div><div id="history-summary" class="count-grid"></div></article>
+ <article class="card span12"><div class="controls" style="justify-content:space-between"><div><div class="label">History explorer</div><div class="sub">Readable lifetime records from SQLite. Tap any row for the complete event card.</div></div><div class="controls"><button class="button" onclick="exportHistory('json')">JSON</button><button class="button" onclick="exportHistory('csv')">CSV</button><button class="button primary" onclick="loadHistory()">Refresh</button></div></div><div id="history-periods" class="periods"></div><canvas id="efficiency-history-chart" class="chart" width="1000" height="210"></canvas><div class="chart-key"><span><i style="background:#70d68b"></i>Daily Wh/mi</span><span><i style="background:#79b8ff"></i>Daily miles</span></div><div id="history-summary" class="count-grid"></div></article>
  <article class="card span12"><div class="filters" id="history-filters"><button class="button active" data-kind="all">All</button><button class="button" data-kind="efficiency">Trips</button><button class="button" data-kind="battery">Battery</button><button class="button" data-kind="regen">Regen</button><button class="button" data-kind="charging">Charging</button><button class="button" data-kind="performance">Performance</button><button class="button" data-kind="settings">Settings</button></div><div id="history-list" class="history-list"><div class="empty">Choose Refresh to inspect disk history.</div></div></article>
  <article class="card span12"><div class="label">Recorder diagnostics</div><div id="history-diag" class="diag">Checking…</div></article>
 </div></section>
@@ -2690,18 +2772,22 @@ DASHBOARD_HTML = r"""<!doctype html>
  <article class="card span6"><div class="label">Cruise speed trim</div><div class="value"><span id="speed-trim">0</span> MPH</div><div class="controls" style="margin-top:14px"><button class="button" onclick="trim(-5)">−5</button><button class="button" onclick="trim(-1)">−1</button><button class="button primary" onclick="setSetting('speed_trim',0)">Reset</button><button class="button" onclick="trim(1)">+1</button><button class="button" onclick="trim(5)">+5</button></div><div class="sub">Changes remain written through the existing atomic NAP settings bridge.</div></article>
  <article class="card span6"><div class="label">Recent setting changes</div><div id="settings-audit" class="history-list"><div class="empty">No recorded changes yet.</div></div></article>
 </div></section>
-</main></div><div id="toast" class="toast"></div>
+<section id="page-phone" class="page"><div class="grid"><article class="card span12"><div class="label">Phone navigation remote</div><div class="sub" style="margin-bottom:12px">Send and test phone guidance without leaving the telemetry application.</div><iframe class="phone-frame" src="/phone" title="NAP phone navigation remote"></iframe></article></div></section>
+</main></div><div id="detail-backdrop" class="detail-backdrop" onclick="if(event.target===this)closeDetail()"><div class="detail-sheet"><div class="detail-head"><div><div id="detail-kind" class="history-kind">EVENT</div><div id="detail-title" class="value" style="font-size:1.65rem">Details</div><div id="detail-time" class="sub"></div></div><button class="button" onclick="closeDetail()">Close</button></div><div id="detail-grid" class="detail-grid"></div><div id="detail-extra"></div></div></div><div id="toast" class="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let activeTab='overview',state={settings:{}},pollTimer=null,historyKind='all',historyData={},routesLoaded=false,currentRoute=null,currentSeg=null,logData=[],batteryLogData=[],hudOn=false,healthDays=30,perfHistoryTick=0;
+const $=id=>document.getElementById(id);let activeTab=localStorage.getItem('nap-active-tab')||'overview',state={settings:{}},pollTimer=null,historyKind=localStorage.getItem('nap-history-kind')||'all',historyData={},historyRows=[],performanceRows=[],routesLoaded=false,currentRoute=null,currentSeg=null,logData=[],batteryLogData=[],hudOn=false,healthDays=Number(localStorage.getItem('nap-health-days'))||30,perfHistoryTick=0,batteryHealthTick=0;
+// Settings live on Home so the driving controls are always prominent.
+const settingsGrid=$('page-settings').querySelector('.grid'),homeGrid=$('page-overview').querySelector('.grid');[...settingsGrid.children].reverse().forEach(card=>homeGrid.prepend(card));$('page-settings').remove();
 const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const n=(v,d=0)=>Number.isFinite(Number(v))?Number(v):d;const stamp=v=>v?new Date(n(v)*1000).toLocaleString():'never';
 function toast(text,bad=false){let el=$('toast');el.textContent=text;el.style.borderColor=bad?'#843d39':'#765526';el.classList.add('on');setTimeout(()=>el.classList.remove('on'),1800)}
 function humanBytes(v){v=n(v);if(v<1024)return v+' B';if(v<1048576)return (v/1024).toFixed(1)+' KB';return (v/1048576).toFixed(1)+' MB'}
 function humanTime(s){s=Math.max(0,n(s));let d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h`:h?`${h}h ${m}m`:`${m}m`}
+function eventDuration(s){s=Math.max(0,n(s));return s<60?s.toFixed(1)+' sec':humanTime(s)}
 function fmtClock(s){s=Math.max(0,n(s));return `${String(Math.floor(s/60)).padStart(2,'0')}:${String(Math.floor(s%60)).padStart(2,'0')}`}
 document.querySelectorAll('.tabs button').forEach(button=>button.onclick=()=>switchTab(button.dataset.tab));
-function switchTab(tab){activeTab=tab;document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+tab));if(tab==='history')loadHistory();if(tab==='cameras')loadRoutes();if(tab==='battery')loadBatteryHealth();if(tab==='settings')loadSettingsAudit();schedulePoll(true)}
-function schedulePoll(immediate=false){clearTimeout(pollTimer);let delay=activeTab==='performance'?500:activeTab==='battery'?2500:activeTab==='energy'?2000:activeTab==='overview'||activeTab==='settings'?3000:0;if(!delay)return;pollTimer=setTimeout(async()=>{if(['energy','performance'].includes(activeTab))await loadLab(activeTab==='performance'&&perfHistoryTick++%40===0);else await loadState(activeTab==='battery'?'battery':'summary');schedulePoll()},immediate?0:delay)}
+function switchTab(tab){if(!$('page-'+tab))tab='overview';activeTab=tab;localStorage.setItem('nap-active-tab',tab);document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+tab));if(tab==='history')loadHistory();if(tab==='cameras')loadRoutes();if(tab==='battery')loadBatteryHealth();schedulePoll(true)}
+function schedulePoll(immediate=false){clearTimeout(pollTimer);let delay=activeTab==='performance'?500:activeTab==='battery'?2500:activeTab==='energy'?2000:activeTab==='overview'?3000:0;if(!delay)return;pollTimer=setTimeout(async()=>{if(['energy','performance'].includes(activeTab))await loadLab(activeTab==='performance'&&perfHistoryTick++%40===0);else{await loadState(activeTab==='battery'?'battery':'summary');if(activeTab==='battery'&&batteryHealthTick++%2===0)await loadBatteryHealth()};schedulePoll()},immediate?0:delay)}
 async function fetchJson(url,options){let response=await fetch(url,{cache:'no-store',...options});if(!response.ok)throw Error('HTTP '+response.status);return response.json()}
 async function loadState(view='summary'){try{let data=await fetchJson('/api/state?view='+view);renderState(data);if(view==='battery')renderBMS(data.bms||{});connected(true,data.ts)}catch(e){connected(false)}}
 function connected(ok,ts){$('top-status').textContent=ok?'CONNECTED':'OFFLINE';$('top-status').className=ok?'good':'bad';$('top-age').textContent=ok&&ts?'Updated '+new Date(ts*1000).toLocaleTimeString():'No response from comma'}
@@ -2713,9 +2799,9 @@ async function loadDiagnostics(){try{let d=await fetchJson('/api/history/status'
 function renderDiagnostics(d){let r=d.recorder||{},db=d.database||{},types=db.types||{};$('recorder-dot').className='dot '+(r.running&&db.ready&&db.dropped===0?'good':'bad');setText('recorder-line',r.running&&db.ready?'Recorder active · disk online':'Recorder needs attention');let order=['efficiency','battery','regen','charging','performance','settings'];$('overview-counts').innerHTML=order.map(k=>`<div class="count"><b>${n(types[k]&&types[k].count)}</b><span>${k}</span></div>`).join('');$('overview-db').textContent=`DB ${db.ready?'READY':'DOWN'} · ${humanBytes(db.size_bytes)} · queue ${n(db.queue_depth)} · written this boot ${n(db.written)} · dropped ${n(db.dropped)} · errors ${n(db.write_errors)} · last write ${stamp(db.last_write_at)}${db.last_error?' · '+db.last_error:''}`}
 function kv(target,rows){$(target).innerHTML=rows.map(x=>`<div class="metric-row"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('')}
 function renderBMS(b){let pv=n(b.pack_v),pi=n(b.pack_i),power=-(pv*pi)/1000,cells=(b.bricks||[]).map(Number).filter(v=>v>2000&&v<5000),temps=Object.values(b.temps_dict||{}).map(Number).filter(v=>v>-40&&v<120),min=cells.length?Math.min(...cells):0,max=cells.length?Math.max(...cells):0,avg=cells.length?cells.reduce((a,v)=>a+v,0)/cells.length:0,usable=n(b.usable_full,Math.max(0,n(b.nom_full)-n(b.buffer))),remain=n(b.usable_rem,Math.max(0,n(b.nom_rem)-n(b.buffer))),display=n(b.display_soc,usable?remain/usable*100:0);
- setText('bms-kw',(power>0?'+':'')+power.toFixed(1));setText('bms-pack-v',pv.toFixed(1));setText('bms-pack-i',pi.toFixed(1));setText('bms-display-soc',display.toFixed(1)+'%');setText('bms-nom-full',n(b.nom_full).toFixed(1));setText('bms-range',Math.round(n(b.rated_range)));setText('bms-max-regen',n(b.max_regen).toFixed(0));setText('bms-max-drive',n(b.max_discharge).toFixed(0));$('bms-regen-bar').style.width=Math.min(100,Math.max(0,-power)/Math.max(60,n(b.max_regen))*100)+'%';$('bms-drive-bar').style.width=Math.min(100,Math.max(0,power)/Math.max(160,n(b.max_discharge))*100)+'%';
+ setText('bms-kw',(power>0?'+':'')+power.toFixed(1));setText('bms-pack-v',pv.toFixed(1));setText('bms-pack-i',pi.toFixed(1));setText('bms-display-soc',display.toFixed(1)+'%');setText('bms-nom-full',n(b.nom_full).toFixed(1));setText('bms-range',Math.round(n(b.rated_range)));setText('bms-max-regen',n(b.max_regen).toFixed(0));setText('bms-max-drive',n(b.max_discharge).toFixed(0));$('battery-fill').setAttribute('width',(87*Math.max(0,Math.min(100,display))/100).toFixed(1));$('bms-regen-bar').style.width=Math.min(100,Math.max(0,-power)/Math.max(60,n(b.max_regen))*100)+'%';$('bms-drive-bar').style.width=Math.min(100,Math.max(0,power)/Math.max(160,n(b.max_discharge))*100)+'%';
  kv('bms-energy-kv',[['Raw BMS SOC',n(b.ui_soc).toFixed(1)+'%'],['Nominal remaining',n(b.nom_rem).toFixed(1)+' kWh'],['Usable full',usable.toFixed(1)+' kWh'],['Usable remaining',remain.toFixed(1)+' kWh'],['Expected remaining',n(b.expected_rem).toFixed(1)+' kWh'],['Ideal remaining',n(b.ideal_rem).toFixed(1)+' kWh'],['Energy buffer',n(b.buffer).toFixed(1)+' kWh'],['Energy to full',n(b.charge_complete).toFixed(1)+' kWh']]);let ctof=v=>v*9/5+32;kv('bms-health-kv',[['Cell range',cells.length?(min/1000).toFixed(3)+'–'+(max/1000).toFixed(3)+' V':'--'],['Cell spread',cells.length?(max-min).toFixed(1)+' mV':'--'],['Average cell',cells.length?(avg/1000).toFixed(3)+' V':'--'],['Temperature range',temps.length?ctof(Math.min(...temps)).toFixed(1)+'–'+ctof(Math.max(...temps)).toFixed(1)+' °F':'--'],['Average temperature',temps.length?ctof(temps.reduce((a,v)=>a+v,0)/temps.length).toFixed(1)+' °F':'--'],['Capacity vs 77.5 kWh',n(b.nom_full)?(n(b.nom_full)/77.5*100).toFixed(1)+'%':'--']]);setText('brick-average',cells.length?'AVG '+(avg/1000).toFixed(3)+' V':'NO CELL DATA');$('brick-grid').innerHTML=(b.bricks||Array(96).fill(0)).map(v=>{let cls=v<2000?'none':v<avg-10?'low':v>avg+10?'high':'ok';return `<div class="brick ${cls}" title="${Math.round(n(v))} mV">${v>2000?(v/1000).toFixed(2):'--'}</div>`}).join('')}
-document.querySelectorAll('.health-days').forEach(b=>b.onclick=()=>loadBatteryHealth(+b.dataset.days));async function loadBatteryHealth(days=healthDays){healthDays=days;document.querySelectorAll('.health-days').forEach(b=>b.classList.toggle('active',+b.dataset.days===days));try{let r=await fetchJson('/api/battery/health?days='+days);setText('battery-confidence',`${String(r.confidence||'learning').toUpperCase()} · ${n(r.sample_count)} saved observations · latest ${stamp(r.last_observation_at)}`);$('battery-health-counts').innerHTML=[['Capacity',r.capacity_retention_pct==null?'Learning':n(r.capacity_retention_pct).toFixed(1)+'%'],['Resistance',r.resistance_mohm==null?'--':n(r.resistance_mohm).toFixed(1)+' mΩ'],['Typical spread',r.typical_cell_spread_mv==null?'--':n(r.typical_cell_spread_mv).toFixed(1)+' mV'],['Largest sag',r.largest_sag_v==null?'--':n(r.largest_sag_v).toFixed(1)+' V'],['Weak brick',r.weakest_brick==null?'--':'#'+(n(r.weakest_brick)+1)],['Peak drive / regen',`${n(r.peak_discharge_kw).toFixed(0)} / ${n(r.peak_regen_kw).toFixed(0)} kW`]].map(x=>`<div class="count"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');drawMultiChart('battery-health-chart',r.trend||[],[{key:'capacity',color:'#79b8ff'},{key:'resistance',color:'#b997ff'},{key:'spread',color:'#f4a641'}])}catch(e){toast('Battery health unavailable',true)}}
+document.querySelectorAll('.health-days').forEach(b=>b.onclick=()=>loadBatteryHealth(+b.dataset.days));async function loadBatteryHealth(days=healthDays){healthDays=days;localStorage.setItem('nap-health-days',days);document.querySelectorAll('.health-days').forEach(b=>b.classList.toggle('active',+b.dataset.days===days));try{let r=await fetchJson('/api/battery/health?days='+days);let live=(r.trend||[]).some(p=>p.live);setText('battery-confidence',`${String(r.confidence||'learning').toUpperCase()} · ${n(r.sample_count)} saved observations · ${live?'live point shown · ':''}latest saved ${stamp(r.last_observation_at)}`);$('battery-health-counts').innerHTML=[['Capacity',r.capacity_kwh==null?'Learning':n(r.capacity_kwh).toFixed(1)+' kWh'],['Retention',r.capacity_retention_pct==null?'Learning':n(r.capacity_retention_pct).toFixed(1)+'%'],['Resistance',r.resistance_mohm==null?'--':n(r.resistance_mohm).toFixed(1)+' mΩ'],['Typical spread',r.typical_cell_spread_mv==null?'--':n(r.typical_cell_spread_mv).toFixed(1)+' mV'],['Largest sag',r.largest_sag_v==null?'--':n(r.largest_sag_v).toFixed(1)+' V'],['Weak brick',r.weakest_brick==null?'--':'#'+(n(r.weakest_brick)+1)]].map(x=>`<div class="count"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');drawHealthChart('battery-health-chart',r.trend||[])}catch(e){connected(false)}}
 async function loadLab(history=false){try{let d=await fetchJson('/api/lab/state'+(history?'?history=1':''));renderLab(d);renderDiagnostics({recorder:d.recorder,database:d.database})}catch(e){toast('Analytics unavailable',true)}}
 function renderLab(d){let live=d.live||{},trip=d.trip||{},energy=d.energy||{},regen=d.regen,charge=d.charge||d.last_charge,power=n(energy.power_kw),miles=n(trip.distance_m)*.000621371,wh=miles>.05?n(trip.energy_kwh)*1000/miles:null;setText('energy-power',(power>0?'+':'')+power.toFixed(1)+' kW');setText('energy-direction',power>1?'Driving':power<-1?'Charging / regen':'Idle');setText('energy-distance',miles.toFixed(1)+' mi');setText('energy-efficiency',wh==null?'Waiting for distance':Math.round(wh)+' Wh/mi');setText('energy-regen',n(energy.regen_kw).toFixed(1)+' kW');setText('energy-regen-state',regen?n(regen.energy_recovered_kwh).toFixed(3)+' kWh this event':'No regen event');renderMeters(d.trip_meters||{});drawEnergy(d.battery_minute||[]);setText('charge-status',d.charge?'Charging now':charge?'Last session':'Waiting');setText('charge-detail',charge?`${n(charge.energy_added_kwh).toFixed(2)} kWh · ${n(charge.peak_kw).toFixed(0)} kW peak`:'Sustained stationary charging is logged after ten seconds.');drawCharge(charge&&charge.curve||[]);setText('perf-speed',Math.round(n(live.speed_mph)));setText('perf-g',n(live.accel_g).toFixed(3));let run=live.drag||d.last_run,m=run&&run.milestones_s||{};setText('perf-chip',live.drag?'RECORDING':run?'LAST RUN':'READY');setText('perf-last',run?`${String(run.kind||'run').toUpperCase()} · ${runResult(run)} · peak ${n(run.peak_accel_g).toFixed(2)} G`:'Automatic recording remains active on the comma.');let keys=['0-10','0-30','0-60','0-100','1/8-mile','1/4-mile'];$('perf-milestones').innerHTML=keys.map(k=>`<div class="count"><b>${m[k]==null?'--':n(m[k]).toFixed(2)+' s'}</b><span>${k}</span></div>`).join('');if(Array.isArray(d.recent_runs))renderPerformance(d.recent_runs)}
 function renderMeters(meters){$('trip-meters').innerHTML=['A','B','SHIFT'].map(name=>{let m=meters[name]||{},mi=n(m.distance_m)*.000621371,eff=mi>.05?n(m.net_kwh)*1000/mi:0;return `<div class="card span4"><div style="display:flex;justify-content:space-between"><b>${name==='SHIFT'?'WORK SHIFT':'TRIP '+name}</b><span class="pill ${m.enabled?'live':''}">${m.enabled?'RUNNING':'PAUSED'}</span></div><div class="value">${mi.toFixed(1)} mi</div><div class="sub">${Math.round(eff)} Wh/mi · ${n(m.regen_kwh).toFixed(2)} kWh regen · ${humanTime(m.elapsed_s)}</div><div class="controls" style="margin-top:12px"><button class="button" onclick="tripAction('${name}','toggle')">Start / pause</button><button class="button" onclick="tripAction('${name}','reset')">Reset + log</button></div></div>`}).join('')}
@@ -2723,15 +2809,39 @@ async function tripAction(name,action){try{let d=await fetchJson('/api/trip',{me
 function drawAxes(ctx,w,h){ctx.clearRect(0,0,w,h);ctx.strokeStyle='#292822';ctx.lineWidth=1;for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo(35,i*h/4);ctx.lineTo(w-8,i*h/4);ctx.stroke()}}
 function line(ctx,vals,color,w,h){vals=vals.filter(v=>Number.isFinite(v));if(vals.length<2)return;let lo=Math.min(...vals),hi=Math.max(...vals),span=Math.max(.1,hi-lo);ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();vals.forEach((v,i)=>{let x=36+i*(w-46)/(vals.length-1),y=9+(hi-v)/span*(h-18);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}
 function drawEnergy(points){let c=$('energy-chart'),ctx=c.getContext('2d');drawAxes(ctx,c.width,c.height);line(ctx,points.map(p=>n(p.v)).filter(v=>v>0),'#79b8ff',c.width,c.height);line(ctx,points.map(p=>n(p.kw)),'#f4a641',c.width,c.height)}
-function drawCharge(points){let c=$('charge-chart'),ctx=c.getContext('2d');drawAxes(ctx,c.width,c.height);line(ctx,points.map(p=>n(p.kw)).filter(v=>v>0),'#b997ff',c.width,c.height)}
+function drawCharge(points){let c=$('charge-chart'),ctx=c.getContext('2d');drawAxes(ctx,c.width,c.height);let p=points.filter(x=>n(x.kw)>0&&n(x.soc)>=0&&n(x.soc)<=100);if(p.length<2)return;let hi=Math.max(10,...p.map(x=>n(x.kw)));ctx.strokeStyle='#b997ff';ctx.lineWidth=3;ctx.beginPath();p.forEach((x,i)=>{let px=36+n(x.soc)/100*(c.width-46),py=9+(hi-n(x.kw))/hi*(c.height-18);i?ctx.lineTo(px,py):ctx.moveTo(px,py)});ctx.stroke();ctx.fillStyle='#a5a095';ctx.font='12px sans-serif';[0,25,50,75,100].forEach(s=>ctx.fillText(s+'%',30+s/100*(c.width-46),c.height-4))}
 function drawMultiChart(id,rows,series){let c=$(id),ctx=c.getContext('2d');drawAxes(ctx,c.width,c.height);series.forEach(s=>line(ctx,rows.map(r=>n(r[s.key],NaN)),s.color,c.width,c.height))}
+function measured(v){return v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v))}
+function drawHealthChart(id,rows){let c=$(id),ctx=c.getContext('2d'),bands=[['capacity','#79b8ff','CAPACITY',' kWh',.2],['sag','#ff6f69','VOLTAGE SAG',' V',.5],['spread','#f4a641','CELL SPREAD',' mV',2]];ctx.clearRect(0,0,c.width,c.height);let times=rows.map(r=>n(r.t)).filter(Boolean),t0=times.length?Math.min(...times):0,t1=times.length?Math.max(...times):1;bands.forEach((band,index)=>{let [key,color,label,unit,minSpan]=band,top=index*c.height/3,height=c.height/3,points=rows.filter(r=>measured(r[key])&&n(r.t)>0),values=points.map(r=>Number(r[key]));ctx.fillStyle=index%2?'#0b0b0a':'#090908';ctx.fillRect(0,top,c.width,height);ctx.strokeStyle='#292822';ctx.beginPath();ctx.moveTo(0,top+height);ctx.lineTo(c.width,top+height);ctx.stroke();ctx.font='bold 12px sans-serif';ctx.fillStyle=color;ctx.fillText(label,10,top+18);if(!points.length){ctx.fillStyle='#77736b';ctx.fillText('learning',c.width-65,top+18);return}let lo=Math.min(...values),hi=Math.max(...values),pad=Math.max(minSpan,(hi-lo)*.15),bottom=top+height-12,ceiling=top+27;lo-=pad;hi+=pad;ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();points.forEach((p,i)=>{let x=55+(n(p.t)-t0)/Math.max(1,t1-t0)*(c.width-70),y=ceiling+(hi-n(p[key]))/(hi-lo)*(bottom-ceiling);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();let last=values[values.length-1];ctx.fillStyle='#f4f1e8';ctx.font='bold 13px sans-serif';ctx.fillText(last.toFixed(1)+unit,c.width-92,top+18);ctx.fillStyle='#77736b';ctx.font='10px sans-serif';ctx.fillText(Math.max(...values).toFixed(1),7,ceiling+5);ctx.fillText(Math.min(...values).toFixed(1),7,bottom)})}
+function drawHealthChart(id,rows){
+ let c=$(id),ctx=c.getContext('2d'),bands=[['capacity','#79b8ff','CAPACITY',' kWh',.2],['sag','#ff6f69','VOLTAGE SAG',' V',.5],['spread','#f4a641','CELL SPREAD',' mV',2]];
+ ctx.clearRect(0,0,c.width,c.height);
+ let times=rows.map(r=>n(r.t)).filter(Boolean),t0=times.length?Math.min(...times):0,t1=times.length?Math.max(...times):1;
+ bands.forEach((band,index)=>{
+  let [key,color,label,unit,minSpan]=band,top=index*c.height/3,height=c.height/3,points=rows.filter(r=>measured(r[key])&&n(r.t)>0),values=points.map(r=>Number(r[key]));
+  ctx.fillStyle=index%2?'#0b0b0a':'#090908';ctx.fillRect(0,top,c.width,height);ctx.strokeStyle='#292822';ctx.beginPath();ctx.moveTo(0,top+height);ctx.lineTo(c.width,top+height);ctx.stroke();ctx.font='bold 12px sans-serif';ctx.fillStyle=color;ctx.fillText(label,10,top+18);
+  if(!points.length){ctx.fillStyle='#77736b';ctx.fillText('learning',c.width-65,top+18);return}
+  let lo=Math.min(...values),hi=Math.max(...values),pad=Math.max(minSpan,(hi-lo)*.15),bottom=top+height-12,ceiling=top+27;lo-=pad;hi+=pad;
+  let xy=points.map(p=>[55+(n(p.t)-t0)/Math.max(1,t1-t0)*(c.width-70),ceiling+(hi-n(p[key]))/(hi-lo)*(bottom-ceiling)]);
+  ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();xy.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));ctx.stroke();ctx.fillStyle=color;xy.forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],3,0,Math.PI*2);ctx.fill()});
+  let last=values[values.length-1];ctx.fillStyle='#f4f1e8';ctx.font='bold 13px sans-serif';ctx.fillText(last.toFixed(1)+unit,c.width-92,top+18);ctx.fillStyle='#77736b';ctx.font='10px sans-serif';ctx.fillText(Math.max(...values).toFixed(1),7,ceiling+5);ctx.fillText(Math.min(...values).toFixed(1),7,bottom);
+ });
+}
 function runResult(r){if(r.result_s!=null)return n(r.result_s).toFixed(2)+' s';let m=r.milestones_s||{};if(m['1/4-mile']!=null)return n(m['1/4-mile']).toFixed(2)+' s';if(m['0-60']!=null)return '0–60 '+n(m['0-60']).toFixed(2)+' s';return r.complete?'Complete':'Partial'}
-function renderPerformance(rows){$('performance-history').innerHTML=rows.length?rows.map(r=>`<div class="history-item"><div class="history-kind">${esc(r.kind||'run')}</div><div><div class="history-title">${esc(r.preset||Object.keys(r.milestones_s||{}).join(' · ')||'Automatic capture')}</div><div class="history-meta">${stamp(r.completed_at||r.started_at)} · ${n(r.peak_discharge_kw).toFixed(0)} kW peak · ${n(r.worst_cell_spread_mv).toFixed(1)} mV spread</div></div><div class="history-result">${runResult(r)}</div></div>`).join(''):'<div class="empty">No saved runs.</div>'}
-document.querySelectorAll('#history-filters .button').forEach(b=>b.onclick=()=>{historyKind=b.dataset.kind;document.querySelectorAll('#history-filters .button').forEach(x=>x.classList.toggle('active',x===b));loadHistory()});
+function eventSag(r){return measured(r.voltage_sag_v)?n(r.voltage_sag_v):measured(r.max_pack_voltage_v)&&measured(r.min_pack_voltage_v)?n(r.max_pack_voltage_v)-n(r.min_pack_voltage_v):null}
+function addStat(rows,label,value){if(value!==null&&value!==undefined&&value!==''&&!String(value).includes('NaN'))rows.push([label,value])}
+function openDetail(kind,r){if(!r)return;let stats=[],c=r.conditions||{},e=r.ending_conditions||{},sag=eventSag(r),title=primaryFor(kind,r)[0];addStat(stats,'Result',kind==='performance'?runResult(r):primaryFor(kind,r)[1]);if(kind==='efficiency'){addStat(stats,'Distance',n(r.distance_mi).toFixed(1)+' mi');addStat(stats,'Efficiency',measured(r.wh_per_mi)?Math.round(n(r.wh_per_mi))+' Wh/mi':null);addStat(stats,'Net energy',n(r.energy_kwh,r.net_kwh).toFixed(2)+' kWh');addStat(stats,'Energy used',measured(r.energy_used_kwh)?n(r.energy_used_kwh).toFixed(2)+' kWh':null);addStat(stats,'Regen',n(r.regen_kwh).toFixed(2)+' kWh');addStat(stats,'Average speed',measured(r.avg_mph)?n(r.avg_mph).toFixed(1)+' mph':null)}if(kind==='charging'){let curve=r.curve||[],first=curve[0]||{},last=curve[curve.length-1]||{};addStat(stats,'Energy added',n(r.energy_added_kwh).toFixed(2)+' kWh');addStat(stats,'Peak charge',n(r.peak_kw).toFixed(0)+' kW');addStat(stats,'SOC window',measured(first.soc)&&measured(last.soc)?n(first.soc).toFixed(1)+' → '+n(last.soc).toFixed(1)+'%':null);addStat(stats,'Charge points',curve.length);addStat(stats,'Start voltage',measured(first.v)?n(first.v).toFixed(1)+' V':null);addStat(stats,'End voltage',measured(last.v)?n(last.v).toFixed(1)+' V':null)}if(kind==='regen'){addStat(stats,'Recovered',n(r.energy_recovered_kwh).toFixed(3)+' kWh');addStat(stats,'Peak regen',n(r.peak_kw).toFixed(0)+' kW')}if(kind==='battery'){addStat(stats,'Nominal capacity',measured(r.nom_full_kwh)?n(r.nom_full_kwh).toFixed(1)+' kWh':null);addStat(stats,'Pack voltage',measured(r.pack_voltage_v)?n(r.pack_voltage_v).toFixed(1)+' V':null);addStat(stats,'Window voltage',measured(r.voltage_min_v)&&measured(r.voltage_max_v)?n(r.voltage_min_v).toFixed(1)+'–'+n(r.voltage_max_v).toFixed(1)+' V':null);addStat(stats,'Voltage sag',measured(r.voltage_sag_v)?n(r.voltage_sag_v).toFixed(1)+' V':null);addStat(stats,'Resistance',measured(r.resistance_mohm)?n(r.resistance_mohm).toFixed(1)+' mΩ':null);addStat(stats,'Cell spread',measured(r.cell_spread_mv)?n(r.cell_spread_mv).toFixed(1)+' mV':null);addStat(stats,'Loaded spread',measured(r.loaded_spread_max_mv)?n(r.loaded_spread_max_mv).toFixed(1)+' mV':null);addStat(stats,'Weakest brick',r.weakest_brick==null?null:'#'+(n(r.weakest_brick)+1)+' · '+n(r.weakest_brick_mv).toFixed(0)+' mV')}if(kind==='performance'){addStat(stats,'Voltage sag',sag==null?null:sag.toFixed(1)+' V');addStat(stats,'Pack voltage',measured(r.min_pack_voltage_v)?n(r.min_pack_voltage_v).toFixed(1)+'–'+n(r.max_pack_voltage_v).toFixed(1)+' V':null);addStat(stats,'Peak discharge',n(r.peak_discharge_kw).toFixed(0)+' kW');addStat(stats,'Peak regen',n(r.peak_regen_kw).toFixed(0)+' kW');addStat(stats,'Peak current',n(r.peak_abs_current_a).toFixed(0)+' A');addStat(stats,'Worst cell spread',n(r.worst_cell_spread_mv).toFixed(1)+' mV');addStat(stats,'Peak acceleration',n(r.peak_accel_g).toFixed(2)+' G');addStat(stats,'Peak deceleration',n(r.peak_decel_g).toFixed(2)+' G')}addStat(stats,'Duration',measured(r.duration_s)?eventDuration(n(r.duration_s)):null);addStat(stats,'Starting SOC',measured(c.soc_pct)?n(c.soc_pct).toFixed(1)+'%':null);addStat(stats,'Ending SOC',measured(e.soc_pct)?n(e.soc_pct).toFixed(1)+'%':null);addStat(stats,'Start temperature',measured(c.pack_temp_c)?(n(c.pack_temp_c)*9/5+32).toFixed(1)+' °F':null);addStat(stats,'End temperature',measured(e.pack_temp_c)?(n(e.pack_temp_c)*9/5+32).toFixed(1)+' °F':null);addStat(stats,'Capacity then',measured(c.nominal_full_kwh)?n(c.nominal_full_kwh).toFixed(1)+' kWh':null);$('detail-kind').textContent=kind;$('detail-title').textContent=title;$('detail-time').textContent=stamp(r.completed_at||r.ended_at||r.recorded_at||r.changed_at||r.started_at);$('detail-grid').innerHTML=stats.map(x=>`<div class="detail-stat"><b>${esc(x[1])}</b><span>${esc(x[0])}</span></div>`).join('');let milestones=r.milestones_s||{};$('detail-extra').innerHTML=Object.keys(milestones).length?`<div class="rule"></div><div class="label">Milestones</div><div class="milestone-grid">${Object.entries(milestones).map(x=>`<div class="detail-stat"><b>${esc(measured(x[1])?n(x[1]).toFixed(x[0].includes('mph')?1:2):x[1])}${x[0].includes('mph')?' mph':' s'}</b><span>${esc(x[0])}</span></div>`).join('')}</div>`:'';$('detail-backdrop').classList.add('open')}
+function closeDetail(){$('detail-backdrop').classList.remove('open')}
+function openPerformance(i){openDetail('performance',performanceRows[i])}function openHistory(i){let x=historyRows[i];if(x)openDetail(x.kind,x.r)}
+function renderPerformance(rows){performanceRows=rows||[];$('performance-history').innerHTML=performanceRows.length?performanceRows.map((r,i)=>`<div class="history-item" onclick="openPerformance(${i})"><div class="history-kind">⚡ ${esc(r.kind||'run')}</div><div><div class="history-title">${esc(r.preset||Object.keys(r.milestones_s||{}).filter(k=>!k.includes('trap')).join(' · ')||'Automatic capture')}</div><div class="history-meta">${stamp(r.completed_at||r.started_at)} · ${n(r.peak_discharge_kw).toFixed(0)} kW · ${eventSag(r)==null?'sag learning':eventSag(r).toFixed(1)+' V sag'} · ${n(r.worst_cell_spread_mv).toFixed(1)} mV spread</div></div><div class="history-result">${runResult(r)} ›</div></div>`).join(''):'<div class="empty">No saved runs yet. Captures appear automatically after a completed event.</div>'}
+document.querySelectorAll('#history-filters .button').forEach(b=>b.onclick=()=>{historyKind=b.dataset.kind;localStorage.setItem('nap-history-kind',historyKind);document.querySelectorAll('#history-filters .button').forEach(x=>x.classList.toggle('active',x===b));loadHistory()});
 async function loadHistory(){try{let [payload,summary,status]=await Promise.all([fetchJson(`/api/history?type=${historyKind}&limit=250`),fetchJson('/api/history/summary?days=30'),fetchJson('/api/history/status')]);historyData=payload;renderHistory(payload);renderHistorySummary(summary);renderHistoryDiag(status)}catch(e){$('history-list').innerHTML='<div class="empty bad">History could not be read.</div>';toast('History read failed',true)}}
-function renderHistorySummary(s){$('history-summary').innerHTML=[['Miles',n(s.distance_mi).toFixed(1)],['Trips',n(s.trip_count)],['Average',s.average_wh_per_mi==null?'--':Math.round(n(s.average_wh_per_mi))+' Wh/mi'],['Regen',n(s.regen_kwh).toFixed(2)+' kWh'],['Charged',n(s.charging_kwh).toFixed(2)+' kWh'],['Runs',n(s.performance_runs)]].map(x=>`<div class="count"><b>${x[1]}</b><span>${x[0]} · 30D</span></div>`).join('')}
+function renderHistorySummary(s){let p=s.efficiency_periods||{},labels=[['today','Today'],['7d','7 days'],['30d','30 days'],['all','Lifetime']];$('history-periods').innerHTML=labels.map(([key,label])=>{let x=p[key]||{};return `<div class="period"><div class="label">${label}</div><b>${x.wh_per_mi==null?'--':Math.round(n(x.wh_per_mi))+' Wh/mi'}</b><span>${n(x.miles).toFixed(1)} miles · ${n(x.trips)} trips</span><span>${n(x.regen_kwh).toFixed(2)} kWh recovered</span></div>`}).join('');$('history-summary').innerHTML=[['30-day miles',n(s.distance_mi).toFixed(1)],['30-day trips',n(s.trip_count)],['30-day regen',n(s.regen_kwh).toFixed(2)+' kWh'],['30-day charged',n(s.charging_kwh).toFixed(2)+' kWh'],['Performance runs',n(s.performance_runs)],['Stored history','SQLite']].map(x=>`<div class="count"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');drawEfficiencyHistory(s.daily_efficiency||[])}
+function drawEfficiencyHistory(rows){let c=$('efficiency-history-chart'),ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);if(!rows.length){ctx.fillStyle='#77736b';ctx.font='14px sans-serif';ctx.fillText('Daily efficiency appears after completed trips are saved.',25,45);return}let wh=rows.map(x=>n(x.wh_per_mi,NaN)).filter(Number.isFinite),miles=rows.map(x=>n(x.miles)),maxWh=Math.max(100,...wh),maxMiles=Math.max(10,...miles),bar=(c.width-55)/rows.length;rows.forEach((r,i)=>{let x=45+i*bar,w=Math.max(2,bar-4),mh=n(r.miles)/maxMiles*(c.height-45);ctx.fillStyle='#79b8ff55';ctx.fillRect(x,c.height-23-mh,w,mh)});ctx.strokeStyle='#70d68b';ctx.lineWidth=3;ctx.beginPath();rows.forEach((r,i)=>{if(!measured(r.wh_per_mi))return;let x=45+(i+.5)*bar,y=12+(maxWh-n(r.wh_per_mi))/maxWh*(c.height-45);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.fillStyle='#77736b';ctx.font='10px sans-serif';rows.forEach((r,i)=>{if(i%Math.max(1,Math.ceil(rows.length/7))===0)ctx.fillText(String(r.day).slice(5),45+i*bar,c.height-6)});ctx.fillStyle='#70d68b';ctx.fillText(Math.round(maxWh)+' Wh/mi',3,18);ctx.fillStyle='#79b8ff';ctx.fillText(Math.round(maxMiles)+' mi',3,c.height-27)}
 function primaryFor(kind,r){if(kind==='efficiency')return [`${n(r.distance_mi).toFixed(1)} mi`,r.wh_per_mi==null?'--':Math.round(n(r.wh_per_mi))+' Wh/mi'];if(kind==='battery')return [`${n(r.nom_full_kwh).toFixed(1)} kWh nominal`,r.cell_spread_mv==null?'--':n(r.cell_spread_mv).toFixed(1)+' mV'];if(kind==='regen')return [`${n(r.energy_recovered_kwh).toFixed(3)} kWh recovered`,n(r.peak_kw).toFixed(0)+' kW'];if(kind==='charging')return [`${n(r.energy_added_kwh).toFixed(2)} kWh added`,n(r.peak_kw).toFixed(0)+' kW'];if(kind==='performance')return [String(r.kind||'run')+' '+String(r.preset||''),runResult(r)];if(kind==='settings')return [`${r.name}: ${String(r.before)} → ${String(r.after)}`,'changed'];return ['Saved record','']}
-function renderHistory(payload){let rows=[];Object.entries(payload).forEach(([kind,list])=>(list||[]).forEach(r=>rows.push({kind,r,t:n(r.completed_at||r.ended_at||r.recorded_at||r.changed_at||r.started_at)})));rows.sort((a,b)=>b.t-a.t);$('history-list').innerHTML=rows.length?rows.map(x=>{let p=primaryFor(x.kind,x.r);return `<div class="history-item"><div class="history-kind">${esc(x.kind)}</div><div><div class="history-title">${esc(p[0])}</div><div class="history-meta">${stamp(x.t)} · ${esc(JSON.stringify(x.r).slice(0,180))}</div></div><div class="history-result">${esc(p[1])}</div></div>`}).join(''):'<div class="empty">No records of this type are stored yet.</div>'}
+function historyMeta(kind,r){if(kind==='efficiency')return `${n(r.energy_kwh,r.net_kwh).toFixed(2)} kWh net · ${n(r.regen_kwh).toFixed(2)} kWh regen · ${n(r.avg_mph).toFixed(0)} mph average`;if(kind==='battery')return `${measured(r.voltage_sag_v)?n(r.voltage_sag_v).toFixed(1)+' V sag · ':''}${measured(r.pack_temp_c)?(n(r.pack_temp_c)*9/5+32).toFixed(0)+' °F · ':''}${measured(r.resistance_mohm)?n(r.resistance_mohm).toFixed(1)+' mΩ resistance':'health sample'}`;if(kind==='charging'){let curve=r.curve||[],a=curve[0]||{},b=curve[curve.length-1]||{};return `${curve.length} curve points${measured(a.soc)&&measured(b.soc)?' · '+n(a.soc).toFixed(0)+'–'+n(b.soc).toFixed(0)+'% SOC':''}`}if(kind==='performance'){let sag=eventSag(r);return `${n(r.peak_discharge_kw).toFixed(0)} kW peak · ${sag==null?'sag learning':sag.toFixed(1)+' V sag'} · ${n(r.worst_cell_spread_mv).toFixed(1)} mV spread`}if(kind==='regen')return `${n(r.peak_kw).toFixed(0)} kW peak · ${n(r.duration_s).toFixed(0)} seconds`;if(kind==='settings')return 'Persistent driving-control change';return 'Saved event'}
+function kindIcon(kind){return({efficiency:'◈',battery:'▰',regen:'↯',charging:'⚡',performance:'◆',settings:'⚙'})[kind]||'•'}
+function renderHistory(payload){historyRows=[];Object.entries(payload).forEach(([kind,list])=>(list||[]).forEach(r=>historyRows.push({kind,r,t:n(r.completed_at||r.ended_at||r.recorded_at||r.changed_at||r.started_at)})));historyRows.sort((a,b)=>b.t-a.t);$('history-list').innerHTML=historyRows.length?historyRows.map((x,i)=>{let p=primaryFor(x.kind,x.r);return `<div class="history-item" onclick="openHistory(${i})"><div class="history-kind">${kindIcon(x.kind)} ${esc(x.kind)}</div><div><div class="history-title">${esc(p[0])}</div><div class="history-meta">${stamp(x.t)} · ${esc(historyMeta(x.kind,x.r))}</div></div><div class="history-result">${esc(p[1])} ›</div></div>`}).join(''):'<div class="empty">No records of this type are stored yet.</div>'}
 function renderHistoryDiag(d){let r=d.recorder||{},db=d.database||{};$('history-diag').textContent=`recorder.running=${!!r.running} · recorder.samples=${n(r.sample_count)} · sample.age=${r.last_sample_age_s==null?'never':r.last_sample_age_s+'s'} · segment=${r.segment||'none'} · db.ready=${!!db.ready} · db.bytes=${n(db.size_bytes)} · queue=${n(db.queue_depth)} · dropped=${n(db.dropped)} · errors=${n(db.write_errors)} · last.write=${stamp(db.last_write_at)}${r.last_error?' · recorder.error='+r.last_error:''}${db.last_error?' · db.error='+db.last_error:''}`;renderDiagnostics(d)}
 function exportHistory(format){window.location.href=`/api/history/export?type=${encodeURIComponent(historyKind)}&format=${format}&limit=1000`}
 function renderSettings(q){['experimental','adaptive_accel','speed_offset'].forEach(k=>{let el=$('setting-'+k);if(el)el.classList.toggle('on',!!q[k])});document.querySelectorAll('.personality').forEach(b=>b.classList.toggle('active',+b.dataset.value===n(q.personality_raw,1)));document.querySelectorAll('#follow .choice').forEach(b=>b.classList.toggle('active',+b.dataset.value===n(q.follow_distance,4)));setText('speed-trim',(n(q.speed_trim)>0?'+':'')+n(q.speed_trim).toFixed(0))}
@@ -2743,7 +2853,7 @@ async function playVideo(route,seg,button){currentRoute=route;currentSeg=seg;doc
 $('cam-select').onchange=()=>{if(currentRoute)playVideo(currentRoute,currentSeg,document.querySelector('.segment.playing'))};$('timeline').oninput=e=>{$('player').currentTime=n(e.target.value)};$('player').ontimeupdate=()=>{let v=$('player'),t=n(v.currentTime);$('timeline').max=n(v.duration,60);$('timeline').value=t;setText('timeline-time',`${fmtClock(t)} / ${fmtClock(v.duration)}`);if(hudOn&&logData.length){let index=Math.min(logData.length-1,Math.floor(t*10)),f=logData[index]||[],b=batteryLogData[index];setText('hud-speed',Math.round(n(f[0])));setText('hud-steer',n(f[1]).toFixed(1));setText('hud-lead',n(f[4])>0?n(f[4]).toFixed(1):'--');setText('hud-pedals',f[3]?'BRAKE':f[2]?'POWER':'COAST');setText('hud-pack',b?`${n(b[2]).toFixed(0)} kW · ${n(b[0]).toFixed(0)} V · ${n(b[3]).toFixed(0)}%`:'PACK DATA --');$('hud-left').style.color=f[5]?'#f4a641':'#555';$('hud-right').style.color=f[6]?'#f4a641':'#555'}};
 function buildEngagement(){let data=logData.map(x=>n(x[7])),start=null,parts=[];data.forEach((v,i)=>{if(v&&start==null)start=i;if(!v&&start!=null){parts.push([start,i]);start=null}});if(start!=null)parts.push([start,data.length]);$('engagement-track').style.background='#282722';$('engagement-track').innerHTML=parts.map(p=>`<i style="display:block;position:absolute;left:${p[0]/data.length*100}%;width:${(p[1]-p[0])/data.length*100}%;height:6px;background:#70d68b"></i>`).join('');$('engagement-track').style.position='relative'}
 function togglePlay(){let v=$('player');v.paused?v.play():v.pause()}function toggleHud(){hudOn=!hudOn;$('hud').classList.toggle('on',hudOn)}function exportVideo(){if(currentRoute)window.location.href=`/export/${encodeURIComponent(currentRoute)}--${currentSeg}?cam=${encodeURIComponent($('cam-select').value)}`}
-loadState('summary');loadDiagnostics();schedulePoll();
+document.querySelectorAll('#history-filters .button').forEach(b=>b.classList.toggle('active',b.dataset.kind===historyKind));switchTab(activeTab);loadState(activeTab==='battery'?'battery':'summary');loadDiagnostics();loadSettingsAudit();
 </script></body></html>"""
 
 PHONE_HTML = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>NAP Nav Remote</title><style>
@@ -2979,7 +3089,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.send_json({"error": str(e)}, 400)
 
 def main():
-    print(f"NAP Telemetry v23 listening on port {PORT} (phone tester: /phone)")
+    print(f"NAP Telemetry v24 listening on port {PORT} (phone remote: /phone)")
     threading.Thread(target=telemetry, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     try: srv.serve_forever()
