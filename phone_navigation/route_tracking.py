@@ -8,6 +8,7 @@ import time
 import uuid
 import tempfile
 from .mapped_stop_signs import fetch_stops
+from .road_stop_lookup import RoadStopLookup
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
 ROUTE_CACHE_PATH = Path('/data/nap_active_route.json')
@@ -130,6 +131,7 @@ def valid_fix(message, mono, now, wall, valid=True, source='gpsLocation'):
         gps_age = wall-message.unixTimestampMillis/1000
         accuracy = float(message.horizontalAccuracy)
         speed = float(message.speed)
+        bearing = float(message.bearingDeg)
         if (not valid or not message.hasFix or not 0 <= age <= 3 or not -1 <= gps_age <= 5
                 or not math.isfinite(accuracy+speed) or accuracy < 0 or accuracy > 40 or not 0 <= speed <= 100):
             return None
@@ -138,7 +140,8 @@ def valid_fix(message, mono, now, wall, valid=True, source='gpsLocation'):
         if source == 'gpsLocationExternal' and accuracy == 0:
             return None
         return {'point': point, 'mono': now-max(age, max(0, gps_age)), 'accuracy_m': accuracy or None,
-                'speed': speed, 'source': source}
+                'speed': speed, 'bearing_deg': bearing % 360 if math.isfinite(bearing) else None,
+                'source': source}
     except (ValueError, TypeError, AttributeError, OverflowError):
         return None
 
@@ -188,6 +191,7 @@ class NavigationTracker:
     def __init__(self, route_request, bridge, update=None, clear=None, location=None):
         self.request, self.bridge, self.update, self.clear = route_request, bridge, update, clear
         self.location = location if location is not None else CommaLocation()
+        self.road_stops = RoadStopLookup()
         self.lock = threading.RLock()
         self.quit = threading.Event()
         self.worker = None
@@ -320,7 +324,7 @@ class NavigationTracker:
                     'accuracy_m': self.fix['accuracy_m'] if fresh else None,
                     'destination': self.destination, 'navigation': self.nav,
                     'message': self.message, 'active': self.destination is not None,
-                    'model_decision': model_decision(),
+                    'model_decision': model_decision(), 'road_stops': self.road_stops.status(),
                     'mapped_stops': {'enabled': stop_enabled,
                                      'state': self.stop_state if stop_enabled else 'off',
                                      'error': self.stop_error if stop_enabled and self.stop_state in ('unavailable', 'partial') else '',
@@ -487,6 +491,7 @@ class NavigationTracker:
         now = time.monotonic() if now is None else now
         with self.lock:
             self.fix = fix
+            self.road_stops.tick(fix, self.destination is not None)
             if self.destination is None:
                 self.bridge.route_active = False
                 self.bridge.clear('No route selected')

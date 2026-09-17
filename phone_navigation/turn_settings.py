@@ -11,7 +11,7 @@ LOCK=threading.Lock()
 
 def read():
     result={'corner_assist':False,'blinker_braking':True,'manual_blinker_turns':False,
-            'mapped_stop_slowdown':False}
+            'mapped_stop_slowdown':False,'road_stop_slowdown':False}
     try:
         with PATH.open() as f:obj=json.loads(f.read(2049))
         for key in result:
@@ -35,7 +35,7 @@ def require_park():
 
 def write(data):
     name,enabled=data.get('name'),data.get('enabled')
-    if name not in ('corner_assist','blinker_braking','manual_blinker_turns','mapped_stop_slowdown') or type(enabled) is not bool:
+    if name not in ('corner_assist','blinker_braking','manual_blinker_turns','mapped_stop_slowdown','road_stop_slowdown') or type(enabled) is not bool:
         raise ValueError('Invalid turn setting')
     if enabled:require_park()
     with LOCK:

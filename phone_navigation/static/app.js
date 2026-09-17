@@ -60,6 +60,8 @@ function render(result){
   $('nav-reason').textContent=`Navigation request: ${decision.desire||'none'} · ${decision.reason||'Diagnostics unavailable; restart may be needed'}`;
   const stops=result.mapped_stops||{};
   $('mapped-stop-status').textContent=!stops.enabled?'Off':stops.state==='loading'?'Loading mapped stops ahead…':stops.state==='unavailable'?`Map lookup unavailable; no stop slowdown. ${stops.error||'Check internet connection.'}`:stops.state==='partial'?`Using cached signs; map refresh failed. ${stops.error||''}`:stops.state==='ready'?(stops.next_distance_m!=null?`Mapped stop sign ${Math.max(0,Math.round(stops.next_distance_m))} m ahead · ${!result.enabled?'speed hint off: navigation influence is off':!result.accuracy_m?'speed hint waiting for GPS accuracy':'speed hint available with active speed control'}`:`Map loaded · ${stops.loaded_ahead||0} matched stop signs ahead · ${Math.round((stops.coverage_remaining_m||0)/1000)} km cached`):'Waiting for route and GPS';
+  const road=result.road_stops||{};
+  $('road-stop-status').textContent=!road.enabled?'Off':road.state==='ready'?(road.next_distance_m!=null?`${road.road||'Current road'} · mapped stop ${Math.round(road.next_distance_m)} m ahead · rolling-speed hint only`:`Matched ${road.road||'current road'} · no direction-matched stop ahead`):road.state==='unavailable'?`Map lookup unavailable: ${road.error||'check connection'}`:`${road.state||'Waiting for road match'}${road.last_response_bytes?` · last lookup ${(road.last_response_bytes/1024).toFixed(0)} KB`:''}`;
   if(!selected){
     $('instruction').textContent=m?.primary_text||result.destination?.label||'Choose your destination';
     $('distance').textContent=nav.route_state==='arrived'?'You have arrived':m?`${Math.max(0,Math.round(m.distance_m*3.28084))} ft`:result.active?'Waiting for route guidance':'Ready when you are';
@@ -95,12 +97,14 @@ async function refreshTurnSettings(){
     $('manual-blinker-turns').checked=t.manual_blinker_turns;$('manual-blinker-turns').disabled=false;
     $('corner-assist').checked=t.corner_assist;$('blinker-braking').checked=t.blinker_braking;
     $('mapped-stop-slowdown').checked=t.mapped_stop_slowdown===true;
+    $('road-stop-slowdown').checked=t.road_stop_slowdown===true;
     $('corner-assist').disabled=$('blinker-braking').disabled=false;
     $('mapped-stop-slowdown').disabled=false;
+    $('road-stop-slowdown').disabled=false;
     $('turn-setting-status').textContent=t.corner_assist&&t.blinker_braking?'Both on: legacy blinker braking still takes priority.':'Settings saved. The updated planner must be loaded for these to take effect.';
-  }catch(e){$('manual-blinker-turns').disabled=$('corner-assist').disabled=$('blinker-braking').disabled=$('mapped-stop-slowdown').disabled=true;$('turn-setting-status').textContent=e.message;}
+  }catch(e){$('manual-blinker-turns').disabled=$('corner-assist').disabled=$('blinker-braking').disabled=$('mapped-stop-slowdown').disabled=$('road-stop-slowdown').disabled=true;$('turn-setting-status').textContent=e.message;}
 }
-for(const [id,name] of [['corner-assist','corner_assist'],['blinker-braking','blinker_braking'],['manual-blinker-turns','manual_blinker_turns'],['mapped-stop-slowdown','mapped_stop_slowdown']]){
+for(const [id,name] of [['corner-assist','corner_assist'],['blinker-braking','blinker_braking'],['manual-blinker-turns','manual_blinker_turns'],['mapped-stop-slowdown','mapped_stop_slowdown'],['road-stop-slowdown','road_stop_slowdown']]){
   $(id).onchange=async()=>{const enabled=$(id).checked;$(id).disabled=true;
     try{await api('turn-setting',{name,enabled});await refreshTurnSettings();}
     catch(e){$(id).checked=!enabled;$(id).disabled=!connected;$('turn-setting-status').textContent=e.message;}

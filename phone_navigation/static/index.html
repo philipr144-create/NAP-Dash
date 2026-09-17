@@ -11,6 +11,10 @@
 <label class="switch" for="mapped-stop-slowdown"><input id="mapped-stop-slowdown" type="checkbox" disabled> Slow for mapped stop signs</label>
 <p id="mapped-stop-status" role="status">Off</p>
 <p class="secondary">Optional. When navigation influence is on and openpilot controls speed, look up OpenStreetMap stop points along your route and ease toward a low rolling speed. This does not command a full stop or decide when it is safe to proceed. Missing or uncertain map/GPS data disables the hint. Turn it on while parked and disengaged; turn it off at any time. Public OpenStreetMap lookup needs an internet connection.</p></section>
+<section class="influence"><h2>Road-only stop hints · Experimental</h2>
+<label class="switch" for="road-stop-slowdown"><input id="road-stop-slowdown" type="checkbox" disabled> Look up stop signs on my current road</label>
+<p id="road-stop-status" role="status">Off</p>
+<p class="secondary">Optional and off by default. Works without a destination only while Experimental Mode is on. Uses comma GPS heading to match one road, then checks OpenStreetMap for direction-matched stop signs. A confident match can request the same low rolling speed hint as route guidance; it cannot command a full stop or decide when to proceed. Uncertain roads or GPS withdraw the hint. Map lookups use cellular or Wi-Fi data; turning this off stops new lookups. Enable while parked and disengaged.</p></section>
 <section class="influence"><h2>Corner speed controls</h2>
 <label class="switch"><input id="manual-blinker-turns" type="checkbox" disabled> Low-speed manual blinker turns</label>
 <p class="secondary">Below 20 mph, one blinker requests a turn in that direction while lateral control is active. You may control gas and brake. Steering takeover withdraws the request. This does not specify turn radius, a 90-degree path, or prevent corner cutting. No delayed-release steering is included. Default off.</p>
