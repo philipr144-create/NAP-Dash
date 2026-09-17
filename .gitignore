@@ -1,0 +1,12 @@
+*
+!/.gitignore
+!/server_v21.py
+!/phone_navigation/
+phone_navigation/*
+!phone_navigation/*.py
+!phone_navigation/static/
+phone_navigation/static/*
+!phone_navigation/static/*.js
+!phone_navigation/static/*.mjs
+!phone_navigation/static/*.html
+!phone_navigation/static/*.css
