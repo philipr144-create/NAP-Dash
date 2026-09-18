@@ -304,13 +304,15 @@ class NavigationTracker:
             try:
                 fix = self.location.sample()
                 self.tick(fix)
-                # A saved destination is not usable route guidance while GPS
-                # or map matching is still recalculating. Let the independent
-                # road lookup run then; the planner still requires its own
-                # strict, fresh position-quality gates.
+                # The road lookup fills gaps while route stop coverage is
+                # unavailable. Avoid duplicate map requests once the route
+                # has usable cached stop coverage at the current progress.
                 with self.lock:
-                    route_active = self.nav.get('route_state') == 'active'
-                self.road_stops.tick(fix, route_active)
+                    route_stop_covered = (self.nav.get('route_state') == 'active'
+                                          and mapped_stops_enabled()
+                                          and self.stop_state in ('ready', 'partial')
+                                          and self.progress <= self.stop_coverage_end)
+                self.road_stops.tick(fix, route_stop_covered)
             except Exception:
                 with self.lock:
                     self.fix = None

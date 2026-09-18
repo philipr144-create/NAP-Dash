@@ -173,10 +173,11 @@ class RoadStopLookup:
             with self.lock:
                 self.fetching = False
 
-    def tick(self, fix, active_route):
-        if active_route or not road_setting_enabled() or not experimental_enabled():
+    def tick(self, fix, route_stop_covered):
+        if route_stop_covered or not road_setting_enabled() or not experimental_enabled():
             with self.lock:
-                self.state = 'off' if not road_setting_enabled() else 'route active' if active_route else 'experimental off'
+                self.state = ('off' if not road_setting_enabled() else
+                              'route stop coverage available' if route_stop_covered else 'experimental off')
                 self.last_match = None
             self.write(None)
             return
