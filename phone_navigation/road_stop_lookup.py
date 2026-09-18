@@ -182,7 +182,9 @@ class RoadStopLookup:
                 or fix['accuracy_m'] > 8 or fix['speed'] < 3 or fix['speed'] > 25
                 or fix.get('bearing_deg') is None):
             with self.lock:
-                self.state, self.last_match = 'waiting for GPS', None
+                self.state = ('waiting for GPS accuracy' if fix and fix.get('accuracy_m') is None else
+                              'waiting for GPS and motion')
+                self.last_match = None
             self.write(None)
             return
         with self.lock:

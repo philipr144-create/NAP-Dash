@@ -302,7 +302,15 @@ class NavigationTracker:
     def run(self):
         while not self.quit.is_set():
             try:
-                self.tick(self.location.sample())
+                fix = self.location.sample()
+                self.tick(fix)
+                # A saved destination is not usable route guidance while GPS
+                # or map matching is still recalculating. Let the independent
+                # road lookup run then; the planner still requires its own
+                # strict, fresh position-quality gates.
+                with self.lock:
+                    route_active = self.nav.get('route_state') == 'active'
+                self.road_stops.tick(fix, route_active)
             except Exception:
                 with self.lock:
                     self.fix = None
@@ -491,7 +499,6 @@ class NavigationTracker:
         now = time.monotonic() if now is None else now
         with self.lock:
             self.fix = fix
-            self.road_stops.tick(fix, self.destination is not None)
             if self.destination is None:
                 self.bridge.route_active = False
                 self.bridge.clear('No route selected')
