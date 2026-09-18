@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .mapped_stop_signs import OVERPASS, angle_gap, allowed_heading, heading, meters
@@ -51,8 +52,10 @@ def fetch_roads(point, opener=urlopen):
             if not isinstance(elements, list):
                 raise ValueError('Invalid road lookup response')
             return elements, len(raw)
+        except HTTPError as exc:
+            errors.append(endpoint.split('/')[2] + ': HTTP ' + str(exc.code))
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            errors.append(type(exc).__name__)
+            errors.append(endpoint.split('/')[2] + ': ' + type(exc).__name__)
     raise ValueError('Road lookup unavailable: ' + ', '.join(errors))
 
 

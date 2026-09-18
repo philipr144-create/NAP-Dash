@@ -2,9 +2,11 @@
 import json
 import math
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 OVERPASS = ('https://overpass-api.de/api/interpreter',
+            'https://lz4.overpass-api.de/api/interpreter',
             'https://overpass.private.coffee/api/interpreter')
 MAX_LOOKAHEAD_M = 5000.0
 
@@ -117,6 +119,8 @@ def fetch_stops(route, start, opener=urlopen):
             if not isinstance(elements, list):
                 raise ValueError('Invalid stop response')
             return match_stops(route, elements, start, end), end
+        except HTTPError as exc:
+            failures.append(endpoint.split('/')[2] + ': HTTP ' + str(exc.code))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             failures.append(endpoint.split('/')[2] + ': ' + type(exc).__name__)
     raise ValueError('OpenStreetMap stop lookup unavailable (' + ', '.join(failures) + ')')
