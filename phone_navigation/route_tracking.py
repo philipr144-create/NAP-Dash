@@ -18,6 +18,12 @@ MAP_STATUS_PATH = Path('/data/nap_map_lookup_status.json')
 
 def mapped_stops_enabled(path=STOP_SETTINGS_PATH):
     try:
+        from openpilot.common.params import Params
+        if Params().get_bool("NAPMapDrivingAssist"):
+            return True
+    except (ImportError, OSError):
+        pass
+    try:
         with open(path) as stream:
             raw = stream.read(2049)
         return len(raw) <= 2048 and json.loads(raw).get('mapped_stop_slowdown') is True
@@ -63,20 +69,27 @@ class Route:
             if not isinstance(step.get('maneuver'), dict):
                 raise ValueError('Invalid route instructions')
 
-    def match(self, location, progress, ahead):
+    def match(self, location, progress, ahead, bearing=None):
         best = None
         candidates = []
+        self.heading_error_deg = None
         for (a, aa), (b, ba) in zip(self.points, self.points[1:]):
-            if ba < progress - 25 or aa > progress + ahead:
+            if ba-aa < .01 or ba < progress - 25 or aa > progress + ahead:
                 continue
             scale = math.cos(math.radians(location[1]))
             x, y = (b[0]-a[0])*scale, b[1]-a[1]
             u, v = (location[0]-a[0])*scale, location[1]-a[1]
             t = max(0, min(1, (u*x+v*y)/(x*x+y*y or 1)))
             error = distance(location, [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t])
+            segment_bearing = math.degrees(math.atan2(x, y)) % 360
+            heading_error = (abs((segment_bearing-bearing+180) % 360-180)
+                             if bearing is not None and math.isfinite(bearing) else None)
+            if heading_error is not None and heading_error > 35:
+                continue
             candidates.append((error, aa+(ba-aa)*t))
             if best is None or error < best[0]:
                 best = error, aa+(ba-aa)*t
+                self.heading_error_deg = heading_error
         # Nearby but substantially different positions along the route are ambiguous.
         # Do not jump to a later loop, crossing, or parallel route segment.
         self.match_ambiguous = best is not None and any(
@@ -154,7 +167,7 @@ class CommaLocation:
         # Construct and use the messaging subscriber only on its worker thread.
         if self.sm is None:
             from cereal import messaging
-            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal'])
+            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'carState'])
         self.sm.update(0)
         now, wall = time.monotonic(), time.time()
         fixes = []
@@ -170,7 +183,14 @@ class CommaLocation:
         # Prefer a nearly simultaneous fix with measured accuracy; an unset
         # qcom accuracy is unknown and otherwise blocks signal/turn gates.
         measured = [f for f in fixes if f['accuracy_m'] is not None and freshest['mono']-f['mono'] <= .5]
-        return max(measured, key=lambda f: f['mono']) if measured else freshest
+        result = max(measured, key=lambda f: f['mono']) if measured else freshest
+        result['wheel_speed'] = None
+        if (self.sm.alive['carState'] and self.sm.valid['carState']
+                and 0 <= now-self.sm.logMonoTime['carState']/1e9 <= .25):
+            speed = float(self.sm['carState'].vEgo)
+            if math.isfinite(speed) and 0 <= speed <= 45:
+                result['wheel_speed'] = speed
+        return result
 
 
 def model_decision(path='/dev/shm/nap_navigation_decision.json'):
@@ -531,7 +551,7 @@ class NavigationTracker:
             if now <= self.reacquire_until:
                 ahead = max(ahead, 10000)
 
-            found = self.route.match(fix['point'], self.progress, ahead)
+            found = self.route.match(fix['point'], self.progress, ahead, fix.get('bearing_deg'))
             if found is None or found[0] > 40:
                 self.bridge.clear('Off route or uncertain GPS; guidance paused')
                 self.nav = {'route_state': 'recalculating'}
@@ -545,13 +565,25 @@ class NavigationTracker:
                 return
             self.off_since = None
             self.reacquire_until = 0.0
-            self.progress = max(self.progress, found[1])
+            # Project along route geometry, then advance only within the fresh GPS
+            # interval using a fresh vehicle-speed sample. Never integrate a fix twice.
+            age = now-fix['mono']
+            wheel_speed = fix.get('wheel_speed')
+            projection_valid = (0 <= age <= 1.5 and wheel_speed is not None
+                                and self.route.heading_error_deg is not None
+                                and self.route.heading_error_deg <= 20
+                                and not self.route.match_ambiguous)
+            projected = found[1] + (wheel_speed*age if projection_valid else 0.0)
+            self.progress = max(self.progress, min(self.route.length, projected))
             self.last_match = now
             if now-self.last_cache_write >= 60:
                 self.save_cache()
             self.maybe_fetch_mapped_stops(now)
             nav = self.route.guidance(self.progress, self.destination['label'], self.route_id)
-            nav['route_context'].update(match_error_m=round(found[0], 1),
+            nav['route_context'].update(projection_valid=projection_valid,
+                                        heading_error_deg=self.route.heading_error_deg,
+                                        path_ambiguous=self.route.match_ambiguous,
+                                        match_error_m=round(found[0], 1),
                                         gps_accuracy_m=fix['accuracy_m'],
                                         gps_age_s=round(now-fix['mono'], 2),
                                         tracking='local GPS / downloaded route',

@@ -78,7 +78,7 @@ class DesireBridge:
     def publish(self, nav, age_ms):
         now = time.monotonic()
         context = nav.get('route_context', {})
-        self.write({'enabled': self.enabled, 'route_active': self.route_active, 'received_mono': now,
+        self.write({'version': 4, 'enabled': self.enabled, 'route_active': self.route_active, 'received_mono': now,
                     'expires_mono': now + max(0, min(3.0, 5.0 - age_ms / 1000)),
                     'route_id': nav['route_id'], 'route_state': nav['route_state'],
                     'maneuver_id': nav.get('maneuver_id', ''),
@@ -87,4 +87,5 @@ class DesireBridge:
                     'map_lookup': {key: context.get(key) for key in
                                    ('map_lookup_state', 'map_loaded_ahead', 'map_coverage_remaining_m')},
                     'position_quality': {key: context.get(key) for key in
-                                         ('match_error_m', 'gps_accuracy_m', 'gps_age_s')}})
+                                         ('match_error_m', 'gps_accuracy_m', 'gps_age_s',
+                                          'heading_error_deg', 'path_ambiguous', 'projection_valid')}})
