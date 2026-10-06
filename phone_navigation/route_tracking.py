@@ -9,6 +9,7 @@ import uuid
 import tempfile
 from .mapped_stop_signs import fetch_stops
 from .road_stop_lookup import RoadStopLookup
+from .vehicle_snapshot import wheel_speed
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
 ROUTE_CACHE_PATH = Path('/data/nap_active_route.json')
@@ -167,7 +168,7 @@ class CommaLocation:
         # Construct and use the messaging subscriber only on its worker thread.
         if self.sm is None:
             from cereal import messaging
-            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'carState'])
+            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal'])
         self.sm.update(0)
         now, wall = time.monotonic(), time.time()
         fixes = []
@@ -184,12 +185,7 @@ class CommaLocation:
         # qcom accuracy is unknown and otherwise blocks signal/turn gates.
         measured = [f for f in fixes if f['accuracy_m'] is not None and freshest['mono']-f['mono'] <= .5]
         result = max(measured, key=lambda f: f['mono']) if measured else freshest
-        result['wheel_speed'] = None
-        if (self.sm.alive['carState'] and self.sm.valid['carState']
-                and 0 <= now-self.sm.logMonoTime['carState']/1e9 <= .25):
-            speed = float(self.sm['carState'].vEgo)
-            if math.isfinite(speed) and 0 <= speed <= 45:
-                result['wheel_speed'] = speed
+        result['wheel_speed'] = wheel_speed(now)
         return result
 
 

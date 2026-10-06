@@ -3,6 +3,8 @@ import csv, io, json, threading, time, os, subprocess, glob, traceback, uuid, sq
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
+from server.airride import request as airride_request
+from server.airride_page import AIRRIDE_HTML
 import cereal.messaging as messaging
 from openpilot.common.params import Params
 
@@ -1239,6 +1241,7 @@ def get_routes():
     return routes
 
 def telemetry():
+    from server.phone_navigation.vehicle_snapshot import publish as publish_vehicle_snapshot
     init_globals()
     svcs = [
         "carState", "selfdriveState", "controlsState",
@@ -1272,6 +1275,7 @@ def telemetry():
     while not STOP.is_set():
         try:
             sm.update(100)
+            publish_vehicle_snapshot(sm)
             
             now = time.monotonic()
             dt = now - last_time
@@ -2756,7 +2760,7 @@ body{background:radial-gradient(circle at 38% 0%,#142e36 0,#09141a 42%,#070b0f 1
 </style></head><body><div class="shell">
 <header class="top"><div><div class="eyebrow">Not Auto Pilot</div><div class="brand">NAP <span>Telemetry</span></div></div><div class="connection"><span>LOW-BANDWIDTH CONSOLE · </span><b id="top-status">CONNECTING</b><div id="top-age">Waiting for comma</div></div></header>
 <nav class="tabs" aria-label="Dashboard sections">
- <button class="active" data-tab="overview">Home</button><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="phone">Phone</button>
+ <button class="active" data-tab="overview">Home</button><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="phone">Phone</button><a href="/airride" style="align-self:center;color:var(--cyan);padding:12px">Air Ride</a>
 </nav>
 
 <main>
@@ -2981,6 +2985,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif p in ("/airride", "/airride/"):
+            self.send_bytes(AIRRIDE_HTML.encode(), "text/html; charset=utf-8")
+        elif p == "/api/airride/status":
+            self.send_json(airride_request({"action": "status"}))
         elif p in ("/phone", "/phone/"):
             b = PHONE_HTML.encode()
             self.send_response(200)
@@ -3157,6 +3165,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             n = int(self.headers.get("Content-Length", "0"))
             if n < 0 or n > NAV_MAX_BODY: return self.send_json({"error": "payload too large"}, 413)
             d = json.loads(self.rfile.read(n).decode())
+            if p == "/api/airride":
+                # Require same-origin JSON: prevent cross-site form commands.
+                origin = self.headers.get("Origin")
+                if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                    return self.send_json({"error": "same origin required"}, 403)
+                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                    return self.send_json({"error": "JSON required"}, 415)
+                if not isinstance(d, dict): return self.send_json({"error": "JSON object required"}, 400)
+                result = airride_request(d)
+                return self.send_json(result, 409 if "error" in result else 200)
             if p == "/api/nav/update":
                 nav = update_navigation(d)
                 return self.send_json({"ok": True, "navigation": nav})

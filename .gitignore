@@ -10,3 +10,12 @@ phone_navigation/static/*
 !phone_navigation/static/*.mjs
 !phone_navigation/static/*.html
 !phone_navigation/static/*.css
+
+!/airride.py
+!/airride_page.py
+!/tests/
+tests/*
+!tests/test_airride.py
+!tests/test_airride_endpoint.py
+!tests/test_airride_integration.py
+!tests/test_card_airride.py

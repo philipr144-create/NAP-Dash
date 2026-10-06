@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from .vehicle_snapshot import require_park
 
 PATH=Path('/data/nap_turn_settings.json')
 LOCK=threading.Lock()
@@ -18,19 +19,6 @@ def read():
             if type(obj.get(key)) is bool:result[key]=obj[key]
     except (OSError,ValueError,TypeError,AttributeError):pass
     return result
-
-
-def require_park():
-    import cereal.messaging as messaging
-    sm=messaging.SubMaster(['carState','carControl'])
-    until=time.monotonic()+1
-    while time.monotonic()<until:sm.update(100)
-    if not all(sm.valid[s] and sm.alive[s] and 0 <= time.monotonic()-sm.logMonoTime[s]/1e9 < .25 for s in ('carState','carControl')):
-        raise ValueError('Wake the car and remain in Park to enable this setting.')
-    cs,cc=sm['carState'],sm['carControl']
-    if (str(cs.gearShifter)!='park' or not cs.canValid or not abs(cs.vEgo)<=.05 or not abs(cs.vEgoRaw)<=.05
-        or cc.enabled or cc.latActive or cc.longActive or cs.cruiseState.enabled):
-        raise ValueError('Park and disengage all controls to enable this setting.')
 
 
 def write(data):
