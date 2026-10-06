@@ -227,6 +227,8 @@ class Endpoint:
             self.controller.vent_stopped = bool(saved.get('vent_stopped', False))
             self.controller.fault = 'Factory restoration unconfirmed after reload; use Restore Factory Control'
         self.saved_recovery = None
+        from server.airride_diagnostics import DiagnosticReader
+        self.diagnostics = DiagnosticReader()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         if os.path.exists(SOCKET):
             os.unlink(SOCKET)
@@ -255,7 +257,17 @@ class Endpoint:
                     raise ValueError('JSON object required')
                 if d.get('action') in ('start', 'heartbeat') and not 0 <= now - d.get('_received_at', -1) < .4:
                     raise ValueError('Request expired; press again')
-                result = self.controller.request(d, now)
+                if d.get('action') == 'read_dtc':
+                    c = self.controller
+                    if not active or not c.permitted(now) or abs(c.speed) >= .1 or c.manual or c.hold or c.pending or c.queue:
+                        raise ValueError('DTC read requires stationary valid data, active safety, and no manual command')
+                    self.diagnostics.start()
+                    result = c.status(now)
+                else:
+                    if self.diagnostics.busy and d.get('action') != 'status':
+                        raise ValueError('DTC read in progress; wait for it to finish')
+                    result = self.controller.request(d, now)
+                result['dtc'] = self.diagnostics.status()
             except (ValueError, TypeError) as exc:
                 result = {'error': str(exc)}
             try:
@@ -266,6 +278,7 @@ class Endpoint:
         if output and output[0][1][1:5] == bytes.fromhex('31 01 03 34') and not self.controller.hold:
             output = []
         c = self.controller
+        output += self.diagnostics.update(can, active and c.permitted(now) and abs(c.speed) < .1 and not c.manual)
         if c.manual or c.restored is False:
             state = {'vent_stopped': c.vent_stopped}
             if state != self.saved_recovery:

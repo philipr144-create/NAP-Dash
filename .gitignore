@@ -19,3 +19,6 @@ tests/*
 !tests/test_airride_endpoint.py
 !tests/test_airride_integration.py
 !tests/test_card_airride.py
+
+!/airride_diagnostics.py
+!tests/test_airride_diagnostics.py
