@@ -15,8 +15,8 @@ LIMIT = 40 * 0.44704
 GROUPS = {'front': (0, 1), 'rear': (2, 3), 'pancake': (0, 1, 2, 3),
           'fl': (0,), 'fr': (1,), 'rl': (2,), 'rr': (3,)}
 STOP = bytes.fromhex('31 02 03 34')
-RESTORE = [STOP, bytes.fromhex('31 01 03 09'), bytes.fromhex('31 02 03 09'), bytes.fromhex('10 01')]
-SETUP = [bytes.fromhex('10 03'), bytes.fromhex('31 01 03 10')]
+RESTORE = [STOP, bytes.fromhex('31 01 03 09'), bytes.fromhex('31 02 03 09'), bytes.fromhex('31 03 03 09'), bytes.fromhex('10 01')]
+SETUP = [bytes.fromhex('10 03'), bytes.fromhex('31 01 03 10'), bytes.fromhex('31 02 03 10')]
 
 
 def frame(payload):
@@ -32,6 +32,7 @@ class Controller:
         self.queue = deque()
         self.pending = None
         self.sent_at = 0
+        self.send_after = 0
         self.next_pulse = 0
         self.corner = 0
         self.manual = False
@@ -58,6 +59,7 @@ class Controller:
         self.reason = reason
         if self.manual and not self.releasing:
             self.pending = None
+            self.send_after = 0
             self.queue = deque([STOP])
             self.stopping = True
 
@@ -68,6 +70,7 @@ class Controller:
         self.reason = reason
         if self.manual and not self.releasing:
             self.pending = None
+            self.send_after = 0
             self.queue = deque(RESTORE[1:] if self.vent_stopped else RESTORE)
             self.releasing = True
             self.stopping = False
@@ -162,7 +165,11 @@ class Controller:
                     if payload == STOP:
                         self.vent_stopped = True
                     if payload == SETUP[1]:
+                        self.send_after = now + .4
+                    if payload == SETUP[2]:
                         self.service_ready = True
+                    if payload == bytes.fromhex('31 01 03 09'):
+                        self.send_after = now + 1.0
                     if self.stopping and not self.queue:
                         self.stopping = False
                         self.reason = 'Venting stopped; use Restore Factory Control to resume leveling'
@@ -188,6 +195,8 @@ class Controller:
                 else:
                     self.release('EAS response timeout')
         if self.pending:
+            return []
+        if now < self.send_after:
             return []
         if self.queue:
             payload = self.queue.popleft()

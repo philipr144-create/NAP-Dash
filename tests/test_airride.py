@@ -19,11 +19,15 @@ class AirRideTest(unittest.TestCase):
         return self.c.request({'action':'start','group':group,'token':TOKEN},self.now)
     def ack(self):
         p=self.c.pending
-        return self.tick(reply=bytes([p[0]+0x40])+p[1:4])
+        out=self.tick(reply=bytes([p[0]+0x40])+p[1:4])
+        if not out and self.c.queue and self.now < self.c.send_after:
+            out=self.tick(dt=self.c.send_after-self.now+.001)
+        return out
     def setup(self,group='front'):
         self.start(group)
         self.assertEqual(self.tick(),[frame(SETUP[0])])
         self.assertEqual(self.ack(),[frame(SETUP[1])])
+        self.assertEqual(self.ack(),[frame(SETUP[2])])
         return self.ack()
     def test_exact_frames_all_groups(self):
         for group,corners in GROUPS.items():
@@ -57,7 +61,7 @@ class AirRideTest(unittest.TestCase):
         self.ack()
         self.assertTrue(self.c.status(self.now)['factory_restored'])
     def test_timeout_never_reports_restored(self):
-        self.setup();self.tick(dt=.61)
+        self.setup();self.c.request({'action':'heartbeat','group':'front','token':TOKEN},self.now);self.tick(dt=.61)
         self.assertTrue(self.c.fault)
         for _ in range(6):self.tick(dt=.61)
         self.assertFalse(self.c.status(self.now)['factory_restored'])
@@ -177,6 +181,25 @@ class AirRideTest(unittest.TestCase):
         for p in RESTORE[2:]:self.assertEqual(self.ack(),[frame(p)])
         self.ack()
         self.assertTrue(self.c.restored)
+    def test_service_entry_waits_before_finish_and_vent(self):
+        self.start();self.tick();self.ack()
+        self.assertEqual(self.tick(reply=bytes.fromhex('71 01 03 10')),[])
+        self.assertFalse(self.c.service_ready)
+        self.assertEqual(self.tick(dt=.39),[])
+        self.assertEqual(self.tick(dt=.02),[frame(SETUP[2])])
+        self.assertEqual(self.ack(),[frame(bytes.fromhex('31 01 03 34 00 00'))])
+        self.assertTrue(self.c.service_ready)
+    def test_restore_waits_one_second_and_queries_result(self):
+        self.c.manual=True;self.c.restored=False;self.c.vent_stopped=True
+        self.c.request({'action':'restore'},self.now)
+        self.tick();self.ack()
+        self.assertEqual(self.tick(reply=bytes.fromhex('71 01 03 09')),[])
+        self.assertEqual(self.tick(dt=.99),[])
+        self.assertEqual(self.tick(dt=.02),[frame(bytes.fromhex('31 02 03 09'))])
+        self.assertEqual(self.ack(),[frame(bytes.fromhex('31 03 03 09'))])
+        self.assertFalse(self.c.restored)
+        self.assertEqual(self.ack(),[frame(bytes.fromhex('10 01'))])
+        self.ack();self.assertTrue(self.c.restored)
     def test_missing_speed_blocks(self):
         self.c=Controller()
         with self.assertRaises(ValueError):self.start()
