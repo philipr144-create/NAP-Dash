@@ -37,6 +37,7 @@ class Controller:
         self.releasing = False
         self.stopping = False
         self.service_ready = False
+        self.vent_stopped = False
         self.fault = ''
         self.reason = 'Ready'
         self.speed = None
@@ -66,7 +67,7 @@ class Controller:
         self.reason = reason
         if self.manual and not self.releasing:
             self.pending = None
-            self.queue = deque(RESTORE)
+            self.queue = deque(RESTORE[1:] if self.vent_stopped else RESTORE)
             self.releasing = True
             self.stopping = False
 
@@ -152,6 +153,8 @@ class Controller:
                 expected = bytes([payload[0] + 0x40]) + payload[1:4]
                 if uds.startswith(expected):
                     self.pending = None
+                    if payload == STOP:
+                        self.vent_stopped = True
                     if payload == SETUP[1]:
                         self.service_ready = True
                     if self.stopping and not self.queue:
@@ -189,6 +192,9 @@ class Controller:
             self.next_pulse = now + .8
         else:
             return []
+        if payload[:4] == bytes.fromhex('31 01 03 34'):
+            # A transmitted start invalidates the previous confirmed stop, even without a reply.
+            self.vent_stopped = False
         self.pending, self.sent_at = payload, now
         self.last_request = payload.hex(' ')
         self.trace.append({'at': now, 'event': 'tx', 'payload': self.last_request})
