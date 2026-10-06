@@ -8,7 +8,7 @@ from server import airride
 
 class EndpointSafety(unittest.TestCase):
     def test_startup_and_status_never_send_commands(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(airride,'SOCKET',directory+'/controller'):
+        with tempfile.TemporaryDirectory() as directory, patch.object(airride,'SOCKET',directory+'/controller'), patch.object(airride,'RECOVERY',directory+'/recovery'):
             ep=airride.Endpoint()
             try:
                 self.assertEqual(ep.update(0,True,[(0x155,b'\x00'*8,0)],active=False),[])
@@ -19,8 +19,19 @@ class EndpointSafety(unittest.TestCase):
                 self.assertEqual(ep.update(0,True,[(0x155,b'\x00'*8,0)],active=True),[])
                 self.assertEqual(ep.controller.request({'action':'status'},time.monotonic())['last_request'],None)
             finally:ep.sock.close()
+    def test_reload_preserves_uncertainty_without_startup_actuation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(airride,'SOCKET',directory+'/controller'), patch.object(airride,'RECOVERY',directory+'/recovery'):
+            with open(airride.RECOVERY,'w') as f:json.dump({'vent_stopped':True},f)
+            ep=airride.Endpoint()
+            try:
+                self.assertEqual(ep.update(0,True,[(0x155,b'\x00'*8,0)],active=True),[])
+                self.assertFalse(ep.controller.restored)
+                self.assertTrue(ep.controller.vent_stopped)
+                self.assertFalse(ep.controller.status(time.monotonic())['available'])
+                self.assertTrue(ep.controller.fault)
+            finally:ep.sock.close()
     def test_stale_queued_start_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(airride,'SOCKET',directory+'/controller'):
+        with tempfile.TemporaryDirectory() as directory, patch.object(airride,'SOCKET',directory+'/controller'), patch.object(airride,'RECOVERY',directory+'/recovery'):
             ep=airride.Endpoint()
             client=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
             try:

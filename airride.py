@@ -10,6 +10,7 @@ import time
 from collections import deque
 
 SOCKET = '/dev/shm/nap-airride.sock'
+RECOVERY = '/data/nap-airride-recovery.json'
 LIMIT = 40 * 0.44704
 GROUPS = {'front': (0, 1), 'rear': (2, 3), 'pancake': (0, 1, 2, 3),
           'fl': (0,), 'fr': (1,), 'rl': (2,), 'rr': (3,)}
@@ -89,11 +90,16 @@ class Controller:
             if isinstance(token, str):
                 self.closed.append(token)
             if token is None or token == self.token:
+                if action == 'restore' and self.restored is False:
+                    self.manual = True
                 if self.fault and self.manual:
                     self.fault = ''
                     self.releasing = False
                 if action == 'restore':
+                    was_releasing = self.releasing
                     self.release('Restoring factory control')
+                    if not was_releasing and self.queue and self.permitted(now):
+                        self.queue.appendleft(SETUP[0])
                 else:
                     self.stop_vent('Stopping venting')
             return self.status(now)
@@ -205,6 +211,13 @@ class Endpoint:
     """Nonblocking local control channel, serviced by card at its normal cadence."""
     def __init__(self):
         self.controller = Controller()
+        if os.path.exists(RECOVERY):
+            with open(RECOVERY) as f:
+                saved = json.load(f)
+            self.controller.restored = False
+            self.controller.vent_stopped = bool(saved.get('vent_stopped', False))
+            self.controller.fault = 'Factory restoration unconfirmed after reload; use Restore Factory Control'
+        self.saved_recovery = None
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         if os.path.exists(SOCKET):
             os.unlink(SOCKET)
@@ -243,6 +256,17 @@ class Endpoint:
         # A stop may have arrived in this cycle; never send the earlier pulse.
         if output and output[0][1][1:5] == bytes.fromhex('31 01 03 34') and not self.controller.hold:
             output = []
+        c = self.controller
+        if c.manual or c.restored is False:
+            state = {'vent_stopped': c.vent_stopped}
+            if state != self.saved_recovery:
+                with open(RECOVERY + '.tmp', 'w') as f:
+                    json.dump(state, f)
+                os.replace(RECOVERY + '.tmp', RECOVERY)
+                self.saved_recovery = state
+        elif c.restored is True and os.path.exists(RECOVERY):
+            os.unlink(RECOVERY)
+            self.saved_recovery = None
         return output
 
 

@@ -51,7 +51,8 @@ class AirRideTest(unittest.TestCase):
     def test_cleanup_sequence_ack_required(self):
         self.setup()
         self.c.request({'action':'restore','token':TOKEN},self.now)
-        self.assertEqual(self.tick(),[frame(RESTORE[0])])
+        self.assertEqual(self.tick(),[frame(SETUP[0])])
+        self.assertEqual(self.ack(),[frame(RESTORE[0])])
         for p in RESTORE[1:]:self.assertEqual(self.ack(),[frame(p)])
         self.ack()
         self.assertTrue(self.c.status(self.now)['factory_restored'])
@@ -147,7 +148,8 @@ class AirRideTest(unittest.TestCase):
         self.setup();self.c.request({'action':'stop','token':TOKEN},self.now)
         self.tick();self.ack()
         self.c.request({'action':'restore'},self.now)
-        self.assertEqual(self.tick(),[frame(RESTORE[1])])
+        self.assertEqual(self.tick(),[frame(SETUP[0])])
+        self.assertEqual(self.ack(),[frame(RESTORE[1])])
         for p in RESTORE[2:]:self.assertEqual(self.ack(),[frame(p)])
         self.ack()
         self.assertTrue(self.c.restored)
@@ -158,12 +160,23 @@ class AirRideTest(unittest.TestCase):
         self.c.request({'action':'start','group':'rear','token':'new-hold-0123456789'},self.now)
         self.tick();self.ack()
         self.c.request({'action':'restore'},self.now)
-        self.assertEqual(self.tick(),[frame(RESTORE[0])])
+        self.assertEqual(self.tick(),[frame(SETUP[0])])
+        self.assertEqual(self.ack(),[frame(RESTORE[0])])
     def test_unacknowledged_stop_is_not_skipped(self):
         self.setup();self.c.request({'action':'stop','token':TOKEN},self.now)
         self.tick()
         self.c.request({'action':'restore'},self.now)
-        self.assertEqual(self.tick(),[frame(RESTORE[0])])
+        self.assertEqual(self.tick(),[frame(SETUP[0])])
+        self.assertEqual(self.ack(),[frame(RESTORE[0])])
+    def test_restore_retry_after_cleanup_reopens_session_without_venting(self):
+        self.c.manual=False;self.c.restored=False;self.c.fault='failed restore'
+        self.c.vent_stopped=True
+        self.c.request({'action':'restore'},self.now)
+        self.assertEqual(self.tick(),[frame(SETUP[0])])
+        self.assertEqual(self.ack(),[frame(RESTORE[1])])
+        for p in RESTORE[2:]:self.assertEqual(self.ack(),[frame(p)])
+        self.ack()
+        self.assertTrue(self.c.restored)
     def test_missing_speed_blocks(self):
         self.c=Controller()
         with self.assertRaises(ValueError):self.start()
