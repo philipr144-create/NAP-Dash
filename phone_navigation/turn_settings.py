@@ -13,7 +13,7 @@ PARAM_KEYS={"corner_assist":"NAPCornerAssist", "manual_blinker_turns":"NAPCityTu
 
 def read():
     result={'corner_assist':False,'blinker_braking':True,'manual_blinker_turns':False,
-            'mapped_stop_slowdown':False,'road_stop_slowdown':False}
+            'mapped_stop_slowdown':False,'road_stop_slowdown':False,'normal_model_stops':False}
     try:
         with PATH.open() as f:obj=json.loads(f.read(2049))
         for key in result:
@@ -29,7 +29,7 @@ def read():
 
 def write(data):
     name,enabled=data.get('name'),data.get('enabled')
-    if name not in ('corner_assist','blinker_braking','manual_blinker_turns','mapped_stop_slowdown','road_stop_slowdown') or type(enabled) is not bool:
+    if name not in ('corner_assist','blinker_braking','manual_blinker_turns','mapped_stop_slowdown','road_stop_slowdown','normal_model_stops') or type(enabled) is not bool:
         raise ValueError('Invalid turn setting')
     # Preserve legacy clients; blinker_braking is stored for compatibility only.
     if enabled:require_park()

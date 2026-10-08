@@ -98,13 +98,15 @@ async function refreshTurnSettings(){
     $('corner-assist').checked=t.corner_assist;$('blinker-braking').checked=t.blinker_braking;
     $('mapped-stop-slowdown').checked=t.mapped_stop_slowdown===true;
     $('road-stop-slowdown').checked=t.road_stop_slowdown===true;
+    $('normal-model-stops').checked=t.normal_model_stops===true;
+    $('normal-model-stops').disabled=false;
     $('corner-assist').disabled=$('blinker-braking').disabled=false;
     $('mapped-stop-slowdown').disabled=false;
     $('road-stop-slowdown').disabled=false;
-    $('turn-setting-status').textContent=t.corner_assist&&t.blinker_braking?'Both on: legacy blinker braking still takes priority.':'Settings saved. The updated planner must be loaded for these to take effect.';
-  }catch(e){$('manual-blinker-turns').disabled=$('corner-assist').disabled=$('blinker-braking').disabled=$('mapped-stop-slowdown').disabled=$('road-stop-slowdown').disabled=true;$('turn-setting-status').textContent=e.message;}
+    $('turn-setting-status').textContent='Settings saved. The updated planner must be loaded for these to take effect.';
+  }catch(e){$('normal-model-stops').disabled=$('manual-blinker-turns').disabled=$('corner-assist').disabled=$('blinker-braking').disabled=$('mapped-stop-slowdown').disabled=$('road-stop-slowdown').disabled=true;$('turn-setting-status').textContent=e.message;}
 }
-for(const [id,name] of [['corner-assist','corner_assist'],['blinker-braking','blinker_braking'],['manual-blinker-turns','manual_blinker_turns'],['mapped-stop-slowdown','mapped_stop_slowdown'],['road-stop-slowdown','road_stop_slowdown']]){
+for(const [id,name] of [['corner-assist','corner_assist'],['blinker-braking','blinker_braking'],['manual-blinker-turns','manual_blinker_turns'],['mapped-stop-slowdown','mapped_stop_slowdown'],['road-stop-slowdown','road_stop_slowdown'],['normal-model-stops','normal_model_stops']]){
   $(id).onchange=async()=>{const enabled=$(id).checked;$(id).disabled=true;
     try{await api('turn-setting',{name,enabled});await refreshTurnSettings();}
     catch(e){$(id).checked=!enabled;$(id).disabled=!connected;$('turn-setting-status').textContent=e.message;}
