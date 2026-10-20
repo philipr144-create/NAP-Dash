@@ -16,11 +16,13 @@ RECORD_LEASE = Path('/dev/shm/nap_sentry_record.json')
 WORKER_STATUS = Path('/dev/shm/nap_sentry_worker.json')
 ROOT = Path('/data/nap_sentry/events')
 CONFIG = Path('/data/nap_sentry/config.json')
-DEFAULTS = dict(analysis_fps=2, pixel_threshold=18, changed_fraction=.035, confirmation_frames=3,
+POLICY = Path('/data/nap_sentry/policy.json')
+RETENTION_SECONDS = 24 * 60 * 60
+DEFAULTS = dict(auto_arm=1, analysis_fps=2, pixel_threshold=18, changed_fraction=.035, confirmation_frames=3,
                 brightness_jump=25, clip_seconds=30, max_clip_seconds=120, cooldown_seconds=15,
                 storage_mb=512, reserve_mb=1024, warn_c=55, suspend_c=60, armed_minutes=30,
                 width=640, height=360, fps=10, bitrate=500000)
-LIMITS = dict(analysis_fps=(1,2), pixel_threshold=(8,80), changed_fraction=(.005,.5), confirmation_frames=(2,6),
+LIMITS = dict(auto_arm=(0,1), analysis_fps=(1,2), pixel_threshold=(8,80), changed_fraction=(.005,.5), confirmation_frames=(2,6),
               brightness_jump=(10,60), clip_seconds=(10,60), max_clip_seconds=(30,180), cooldown_seconds=(5,120),
               storage_mb=(64,2048), reserve_mb=(512,4096), warn_c=(45,60), suspend_c=(50,65), armed_minutes=(5,120),
               width=(320,1280), height=(240,720), fps=(5,15), bitrate=(200000,2000000))
@@ -108,13 +110,23 @@ class Store:
                 continue
             d=read(p)
             if d.get('id') == p.stem and re.fullmatch(r'[0-9a-f]{32}',p.stem):
+                d['expires_at']=None if d.get('protected') else d.get('timestamp',0)+RETENTION_SECONDS
                 rows.append(d)
         return sorted(rows,key=lambda x:x.get('timestamp',0),reverse=True)
     def usage(self):
-        used=sum(p.stat().st_size for p in self.root.iterdir() if p.is_file() and not p.is_symlink())
+        used=0
+        for p in self.root.iterdir():
+            try:
+                if p.is_file() and not p.is_symlink():used+=p.stat().st_size
+            except FileNotFoundError:pass  # Atomic clip finalization/retention may rename a file.
         return {'used_bytes':used,'free_bytes':shutil.disk_usage(self.root).free,'event_count':len(self.events())}
     def prune(self, cfg):
         with self.locked():
+            # Age expiry is independent of quota, arming, or a connected browser.
+            cutoff=time.time()-RETENTION_SECONDS
+            for d in self.events():
+                if d.get('timestamp',0)<=cutoff and not d.get('protected') and d.get('state') not in ('recording','finalizing'):
+                    self._delete(d['id'])
             usage=self.usage()
             for d in reversed(self.events()):
                 if usage['used_bytes'] < cfg['storage_mb']*1048576 and usage['free_bytes'] > cfg['reserve_mb']*1048576 and usage['event_count'] < 1000:

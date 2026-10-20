@@ -6,12 +6,12 @@ Parked security for NAP Dash on comma 3: front-camera motion events and manual e
 
 Open **NAP Dash → Sentry**. Use the existing PIN (`000000` by user request). The existing “Remember on this browser” setting is preserved. Connect displays actual sensor, storage, and safety status.
 
-- **Arm / Disarm:** Start/stop parked monitoring. Default armed session is 30 minutes, configurable to 5–120 minutes. Arming does not extend an existing armed deadline. Every reboot starts disarmed. Suspensions require explicit rearming after conditions become safe.
+- **Resume monitoring / Pause until next drive:** Control parked monitoring. Automatic offroad arming is enabled by default. After a safety-stabilization delay (normally ten seconds, sixty after a safety interruption), monitoring starts without a browser or a manual Arm request and continues while powered, offroad, and safe. There is no automatic-mode 30-minute timeout. Resume monitoring starts it explicitly; Pause until next drive is remembered across Dash/device restarts and clears when driving/ignition is observed again. The auto-arm checkbox can disable the feature persistently. Legacy timed manual sessions remain available when automatic arming is disabled.
 - **Live view / Stop live view:** Connect all three cameras on demand. Five minute absolute limit, 20 second lost-heartbeat timeout. Ending live view leaves an independently armed monitor running. Disarm stops all security activity.
 - **Snapshot:** Save a low-resolution grayscale front-camera image without requiring streaming or video encoding.
 - **Manual record / Stop recording:** Save a front-camera MP4. Default duration/tail is 30 seconds; maximum clip duration is 120 seconds. Ongoing motion extends the tail within the maximum; trigger cooldown defaults to 15 seconds.
 - **Motion detection:** Toggle simple frame differences while armed. No neural models.
-- **Events:** Play clips, inspect thumbnails, protect/unprotect events, or delete individual events. Protect prevents automatic retention deletion, but explicit Delete still removes the selected event.
+- **Events:** Play clips, inspect thumbnails, protect/unprotect events, or delete individual events. Unprotected finalized evidence expires after 24 hours. Cleanup runs at startup and at least once per minute while Dash is running, even if monitoring is paused or disabled. Protected evidence is exempt. The quota may remove oldest unprotected evidence sooner. Older-event pagination covers the full bounded history. Protect prevents automatic retention deletion, but explicit Delete still removes the selected event.
 - **Settings:** Disarm and stop live viewing before saving. Conservative limits constrain all configurable values.
 
 Remote live media requires direct private/Tailscale connectivity to the comma. An HTTPS page tunnel alone does not relay WebRTC media. All API/evidence routes require the PIN. The WebRTC listener is loopback-only at `127.0.0.1:5002`. No unauthenticated public camera or recording endpoint is added.
@@ -24,7 +24,7 @@ Remote live media requires direct private/Tailscale connectivity to the comma. A
 - **Armed monitoring:** `camerad` plus `server.sentry_worker`. The worker samples existing VisionIPC NV12 luma at 1–2 fps, downsamples before processing, blurs, compensates median brightness shifts, rejects isolated pixel noise, and requires consecutive motion confirmation. No encoding runs merely to monitor motion.
 - **Recording:** `server.sentry_encoder` execs the existing hardware `encoderd --sentry`, with a parked-only bounded profile. The worker waits for a keyframe, writes front-camera H264, then remuxes with the existing `ffmpeg_full` using stream copy. No software video re-encoding.
 - **Viewing:** The same parked encoder also provides all three live tracks through the existing teleoprtc/aiortc infrastructure. Recording and viewing share it.
-- **Suspended:** Invalid/stale safety data, ignition/onroad state, shutdown/reboot request, high temperature, invalid power, or worker/camera failure removes security demand. Unsafe conditions never cause an automatic rearm.
+- **Suspended:** Invalid/stale safety data, ignition/onroad state, shutdown/reboot request, high temperature, invalid power, or worker/camera failure removes security demand. No automatic restart occurs while conditions remain unsafe. Safe thermal/power recovery is delayed and uses temperature hysteresis; camera/worker faults are latched for the parking period.
 
 The camera hardware still captures its native streams. Lower motion-analysis rate reduces analysis work, not camera hardware power. The existing stream encoder architecture starts all three hardware encoding tracks when recording or viewing, although evidence records front only. This implementation does not add separate full-resolution capture or image conversion.
 
@@ -39,7 +39,7 @@ The camera hardware still captures its native streams. Lower motion-analysis rat
 - Per-clip byte cap is the smaller of 128 MB and half the security allowance. Clip lengths and repeated trigger frequency are bounded. No encoded pre-event footage is retained; the subscriber drains unused packets.
 - Metadata is atomic JSON; active recordings use `.partial.h264`. Interrupted clips are remuxed on the next worker start when decodable, or marked failed; orphan partial files are removed only inside the security evidence directory. Finalization timeout is bounded to fit manager shutdown.
 
-Configuration lives at `/data/nap_sentry/config.json`; runtime PIN at `/data/nap_sentry_pin` (0600). Neither is tracked. Events, credentials, and private camera images are not source artifacts.
+Configuration lives at `/data/nap_sentry/config.json`; pause/fault intent is in `/data/nap_sentry/policy.json`; runtime PIN at `/data/nap_sentry_pin` (0600). Neither is tracked. Events, credentials, and private camera images are not source artifacts.
 
 ## Integration and recovery
 
@@ -75,10 +75,18 @@ cd /data/server
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
 ```
 
-Nineteen regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
+Thirty regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
 
 Actual comma bench checks also passed: low-rate camera sampling without encoder; real user hand movement triggered a finalized front-camera clip (313 decoded frames, 640×360/10 fps, about 2 MB); real snapshot; manual clip; simultaneous physical three-camera WebRTC frames; heartbeat/disconnect cleanup preserving arming; browser event playback; private thumbnails/video and range requests; protect/unprotect/delete; decodable interrupted H264 recovery; and disarm resource release.
 
 Short bench input-power samples (including a final 58.7-second monitoring sample) were approximately 1.8 W disarmed, 3.7–4.2 W monitoring, 4.3 W recording, and 4.6 W viewing with an on-device validation client. The local viewing client adds CPU/decoding load, so that figure is not a remote-phone benchmark. These are preliminary indoor samples, not summer-heat, battery endurance, or vehicle-runtime claims. See the delivered measurement report for sample durations and limits.
 
 Still required before relying on unattended vehicle security: in-car voltage characterization, ignition transition with the physical vehicle, summer/soak thermal behavior, realistic lighting/motion false-trigger tuning, long-duration parked power/endurance, and normal driving camera/encoder transition confirmation. Thermal and low-power guard logic was tested on-device with controlled test inputs; the physical device was not intentionally overheated or undervolted.
+
+## Automatic offroad and 24-hour history update
+
+Auto-arm is enabled by default (`auto_arm: 1`). Automatic sessions renew only a short watchdog lease, so background monitoring has no parking-duration countdown. The live-view limit remains five minutes. The monitoring/live indicator says **While offroad** for automatic operation. Existing power shutdown behavior is not changed; Sentry cannot monitor or erase files while the device is powered off. Expired evidence is cleaned when Dash next runs. Motion detection and stored evidence remain front-camera-only; simultaneous live viewing still supports all three cameras.
+
+The rolling history stores events, not continuous video. Protected events remain until explicitly deleted. The 512 MB default allowance, 1 GB free-space reserve, 1,000-event cap, and all clip limits remain, so retaining every event for a full day depends on available space.
+
+To roll back this update to manual/timed V2, restore `nap_sentry.py`, `sentry_common.py`, and `sentry_page.py` from `/data/nap_backups/sentry-autoarm-20261020/`, restore the backed-up `config.json` to `/data/nap_sentry/config.json`, and reboot while parked. No encoder, manager, driving, or boot UI changes are part of this update.

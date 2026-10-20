@@ -23,7 +23,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();r=Path(self.tmp.name)
         self.disk=patch.object(c.shutil,'disk_usage',return_value=NS(free=10*1073741824));self.disk.start()
-        self.old={k:getattr(c,k) for k in ('LEASE','RECORD_LEASE','WORKER_STATUS','ROOT','CONFIG')};self.token=n.TOKEN
+        self.old={k:getattr(c,k) for k in ('LEASE','RECORD_LEASE','WORKER_STATUS','ROOT','CONFIG','POLICY')};self.token=n.TOKEN
         for k in self.old:setattr(c,k,r/k)
         n.TOKEN=r/'pin'
     def tearDown(self):
@@ -144,5 +144,69 @@ class StorageTests(Base):
         worker.packet(msg);self.assertEqual(worker.frames,0)
         msg.livestreamRoadEncodeData.idx.flags=8;msg.livestreamRoadEncodeData.header=b'header'
         worker.packet(msg);self.assertEqual(worker.frames,1);worker.file.close();worker.file=None
+
+class AutomaticTests(Base):
+    def setUp(self):
+        super().setUp();self.obj=n.Sentry();self.obj.safe=True;self.obj.cooldown=0
+        self.obj.metrics={'max_c':40}
+    def test_offroad_arms_without_browser_and_keeps_renewing(self):
+        self.obj.update_auto(100,True);self.assertFalse(self.obj.armed_until)
+        self.obj.update_auto(110,True);self.assertTrue(self.obj.auto_armed)
+        self.obj.update_auto(3600,True);self.assertEqual(self.obj.armed_until,3660)
+        self.assertIsNone(self.obj.status()['armed_remaining'])
+    def test_drive_stops_and_next_park_rearms(self):
+        self.obj.pause_auto=True;self.obj.fault_blocked=True;self.obj.save_policy()
+        self.obj.update_auto(100,False,driving=True)
+        self.assertFalse(self.obj.pause_auto);self.assertFalse(self.obj.fault_blocked)
+        self.obj.update_auto(200,True);self.obj.update_auto(210,True);self.assertTrue(self.obj.auto_armed)
+    def test_manual_pause_survives_restart_until_next_drive(self):
+        h=Handler('disarm',body={});self.obj.handle(h)
+        self.obj.update_auto(100,True);self.obj.update_auto(200,True);self.assertFalse(self.obj.armed_until)
+        new=n.Sentry();self.assertTrue(new.pause_auto)
+        new.safe=True;new.cooldown=0;new.update_auto(300,True);self.assertFalse(new.armed_until)
+        new.update_auto(400,False,driving=True);new.update_auto(500,True);new.update_auto(510,True);self.assertTrue(new.auto_armed)
+    def test_no_arm_without_safe_park_data(self):
+        self.obj.safe=False;self.obj.reason='Waiting for telemetry'
+        for now in (100,200,300):self.obj.update_auto(now,True)
+        self.assertFalse(self.obj.armed_until)
+        self.obj.safe=True
+        for now in (400,500):self.obj.update_auto(now,False)
+        self.assertFalse(self.obj.armed_until)
+    def test_thermal_resume_needs_cooling_and_stable_safety(self):
+        self.obj.armed_until=500;self.obj.auto_armed=True
+        self.obj.safe=False;self.obj.reason='Device too warm';self.obj.metrics['max_c']=60
+        self.obj.update_auto(100,True);self.obj.off();self.obj.cooldown=0
+        self.obj.safe=True;self.obj.reason='';self.obj.metrics['max_c']=59
+        self.obj.update_auto(200,True);self.obj.update_auto(300,True);self.assertFalse(self.obj.armed_until)
+        self.obj.metrics['max_c']=50;self.obj.update_auto(400,True)
+        self.obj.update_auto(459,True);self.assertFalse(self.obj.armed_until)
+        self.obj.update_auto(460,True);self.assertTrue(self.obj.auto_armed)
+    def test_auto_setting_persisted(self):
+        h=Handler('auto',body={'enabled':False});self.obj.handle(h);self.assertEqual(h.result[0],200)
+        self.obj.update_auto(100,True);self.obj.update_auto(500,True);self.assertFalse(self.obj.armed_until)
+        self.assertFalse(n.Sentry().cfg['auto_arm'])
+    def test_fault_blocks_automatic_retry(self):
+        self.obj.fault_blocked=True
+        self.obj.update_auto(100,True);self.obj.update_auto(500,True);self.assertFalse(self.obj.armed_until)
+
+class AgeRetentionTests(Base):
+    def test_expiry_without_storage_pressure(self):
+        store=c.Store();old=store.create('snapshot',b'old',c.DEFAULTS)
+        old['timestamp']=time.time()-86401;store.metadata(old)
+        fresh=store.create('snapshot',b'fresh',c.DEFAULTS)
+        self.assertFalse(store.path(old['id'],'.jpg').exists());self.assertTrue(store.path(fresh['id'],'.jpg').exists())
+    def test_protected_and_active_survive_age_expiry(self):
+        store=c.Store();old=store.create('snapshot',b'old',c.DEFAULTS)
+        old.update(timestamp=time.time()-86401,protected=True);store.metadata(old)
+        active=store.create('motion',b'active',c.DEFAULTS);active['timestamp']=time.time()-86401;store.metadata(active)
+        store.prune(c.DEFAULTS)
+        self.assertTrue(store.path(old['id'],'.jpg').exists());self.assertTrue(store.path(active['id'],'.json').exists())
+    def test_recent_events_kept_and_expiry_reported(self):
+        store=c.Store();e=store.create('snapshot',b'fresh',c.DEFAULTS);store.prune(c.DEFAULTS)
+        self.assertAlmostEqual(store.events()[0]['expires_at'],e['timestamp']+86400)
+    def test_pause_does_not_disable_expiry(self):
+        obj=n.Sentry();h=Handler('disarm',body={});obj.handle(h)
+        e=obj.store.create('snapshot',b'expire',obj.cfg);e['timestamp']=time.time()-90000;obj.store.metadata(e)
+        obj.store.prune(obj.cfg);self.assertFalse(obj.store.events())
 
 if __name__=='__main__':unittest.main()

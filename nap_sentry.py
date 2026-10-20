@@ -45,6 +45,10 @@ class Sentry:
         self.reason='Waiting for safety telemetry';self.safe=False;self.negotiating=False
         self.motion=True;self.snapshot_id='';self.record_id='';self.stop_seq=0
         self.metrics={};self.suspended=False;self.activity_start=0;self.last_sensor=0
+        policy=common.read(common.POLICY)
+        self.pause_auto=bool(policy.get('paused'));self.fault_blocked=bool(policy.get('fault'))
+        self.auto_armed=False;self.safe_since=None;self.resume_wait=10;self.cool_resume=False
+        self.last_prune=-60
         self.off()
         try:
             fd=os.open(TOKEN,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
@@ -56,8 +60,35 @@ class Sentry:
     def off(self):
         self.deadline=self.heartbeat=self.armed_until=self.transient_until=0
         self.record_id=self.snapshot_id='';self.stop_seq+=1;self.activity_start=0
+        self.auto_armed=False
         self.cooldown=time.monotonic()+5
         common.LEASE.unlink(missing_ok=True);common.RECORD_LEASE.unlink(missing_ok=True)
+    def save_policy(self):
+        common.atomic(common.POLICY,{'paused':self.pause_auto,'fault':self.fault_blocked})
+    def update_auto(self,now,parked,driving=False):
+        # Manual pause/fault is scoped to this parking period, including Dash restarts.
+        if driving:
+            self.pause_auto=False;self.fault_blocked=False;self.safe_since=None
+            self.auto_armed=False;self.resume_wait=10;self.cool_resume=False
+            common.POLICY.unlink(missing_ok=True)
+            return
+        if not parked or not self.safe:
+            if self.armed_until or self.deadline or self.transient_until:
+                self.resume_wait=60
+            if self.reason=='Device too warm':
+                self.cool_resume=True;self.resume_wait=60
+            self.safe_since=None
+            return
+        if not self.cfg['auto_arm'] or self.pause_auto or self.fault_blocked:
+            self.safe_since=None
+            return
+        if self.cool_resume and self.metrics.get('max_c',100)>=self.cfg['warn_c']:
+            self.safe_since=None
+            return
+        if self.safe_since is None:self.safe_since=now
+        if now-self.safe_since>=self.resume_wait and now>=self.cooldown:
+            # The short renewable deadline is a watchdog, not a parking session timer.
+            self.armed_until=now+60;self.auto_armed=True;self.suspended=False;self.cool_resume=False
     def worker(self):
         d=common.read(common.WORKER_STATUS)
         return d if 0<=time.monotonic()-d.get('mono',0)<3 else {}
@@ -67,7 +98,10 @@ class Sentry:
         state='suspended' if self.suspended else 'recording' if recording else 'viewing' if self.deadline else 'monitoring' if self.armed_until else 'disarmed'
         return dict(state=state,active=common.enabled(resource='live'),armed=self.armed_until>now,motion=self.motion,
                     safe=self.safe,reason=self.reason,warning=self.metrics.get('max_c',0)>=self.cfg['warn_c'],
-                    remaining=max(0,int(self.deadline-now)),armed_remaining=max(0,int(self.armed_until-now)),
+                    remaining=max(0,int(self.deadline-now)),armed_remaining=None if self.auto_armed else max(0,int(self.armed_until-now)),
+                    auto_enabled=bool(self.cfg['auto_arm']),auto_armed=self.auto_armed,paused=self.pause_auto,
+                    fault_blocked=self.fault_blocked,retention_hours=24,
+                    auto_ready_in=max(0,int(self.resume_wait-(now-self.safe_since))) if self.safe_since is not None else None,
                     camera=bool(w.get('camera')),recording=recording,worker=w,metrics=self.metrics,storage=storage,config=self.cfg)
     def sensors(self,ds):
         sensors={}
@@ -93,8 +127,14 @@ class Sentry:
                 sm.update(200)
                 with self.lock:
                     now=time.monotonic();ds=sm['deviceState']
+                    if now-self.last_prune>=60:
+                        self.store.prune(self.cfg);self.last_prune=now
                     self.reason=safety(sm,now,self.cfg)
-                    if params.get_bool('DoShutdown') or params.get_bool('DoReboot') or params.get_bool('IsOnroad'):
+                    shutting_down=params.get_bool('DoShutdown') or params.get_bool('DoReboot')
+                    onroad=params.get_bool('IsOnroad')
+                    fresh=all(sm.valid[k] and sm.recv_time[k] and now-sm.recv_time[k]<=3 for k in ('deviceState','pandaStates'))
+                    driving=bool(fresh and (ds.started or any(p.ignitionLine or p.ignitionCan for p in sm['pandaStates'])))
+                    if shutting_down or onroad:
                         self.reason='Vehicle starting or device shutting down'
                     self.safe=not self.reason
                     self.metrics.update(max_c=round(float(ds.maxTempC),1),thermal=str(ds.thermalStatus),supply_mv=int(sm['peripheralState'].voltage))
@@ -105,6 +145,7 @@ class Sentry:
                             mv,ma=HARDWARE.get_voltage(),HARDWARE.get_current()
                             self.metrics.update(input_mv=mv,input_ma=ma,input_w=round(mv*ma/1e6,2))
                         except Exception:self.metrics['input_w']=None
+                    self.update_auto(now,parked=bool(fresh and not driving and not onroad and not shutting_down),driving=driving)
                     if not self.safe:
                         if self.deadline or self.armed_until or self.transient_until:self.suspended=True
                         self.off()
@@ -124,7 +165,7 @@ class Sentry:
                         if not self.activity_start:self.activity_start=now
                         if now-self.activity_start>15 and not self.worker().get('camera'):
                             self.reason='Camera or monitor unavailable; rearm after checking device'
-                            self.suspended=True;self.off();continue
+                            self.suspended=True;self.fault_blocked=True;self.save_policy();self.off();continue
                         effective=dict(self.cfg)
                         if self.metrics['max_c']>=self.cfg['warn_c']:effective['analysis_fps']=1
                         common.atomic(common.LEASE,dict(until=now+3,deadline=until,live=bool(self.deadline),armed=bool(self.armed_until),motion=self.motion,snapshot=self.snapshot_id,record_request=self.record_id,stop_seq=self.stop_seq,config=effective))
@@ -132,7 +173,7 @@ class Sentry:
                         self.activity_start=0;common.LEASE.unlink(missing_ok=True)
             except Exception:
                 with self.lock:
-                    self.safe=False;self.reason='Safety telemetry unavailable';self.suspended=True;self.off()
+                    self.safe=False;self.reason='Safety telemetry unavailable';self.suspended=True;self.safe_since=None;self.resume_wait=60;self.off()
             time.sleep(.2)
     def media(self,h,ident,kind):
         suffix='.jpg' if kind=='thumbnail' else '.mp4'
@@ -173,7 +214,7 @@ class Sentry:
             if h.command=='GET':
                 if op=='status':
                     with self.lock:h.send_json(self.status())
-                elif op=='events':h.send_json({'events':self.store.events()[:100],'storage':self.store.usage()})
+                elif op=='events':h.send_json({'events':self.store.events()[:1000],'storage':self.store.usage()})
                 elif op.startswith('media/'):
                     parts=op.split('/')
                     if len(parts)!=3 or parts[2] not in ('thumbnail','video'):raise ValueError('Invalid evidence path')
@@ -188,7 +229,15 @@ class Sentry:
             with self.lock:
                 now=time.monotonic()
                 if op=='stop':self.deadline=0
-                elif op=='disarm':self.off();self.suspended=False
+                elif op=='disarm':
+                    self.pause_auto=True;self.save_policy();self.off();self.suspended=False
+                elif op=='auto':
+                    if type(body.get('enabled')) is not bool:raise ValueError('Boolean required')
+                    self.cfg=common.validate_config({'auto_arm':int(body['enabled'])},self.cfg)
+                    common.atomic(common.CONFIG,self.cfg)
+                    self.pause_auto=False;self.safe_since=None;self.save_policy()
+                    if not body['enabled'] and self.auto_armed:
+                        self.armed_until=0;self.auto_armed=False;self.stop_seq+=1
                 elif op=='record_stop':self.stop_seq+=1;self.record_id='';self.transient_until=min(self.transient_until,now+3)
                 elif op=='delete':self.store.delete(body.get('id'))
                 elif op=='protect':
@@ -210,7 +259,10 @@ class Sentry:
                         if not self.deadline:self.deadline=now+MAX_SESSION
                         self.heartbeat=now
                     elif op=='arm':
-                        if not self.armed_until:self.armed_until=now+self.cfg['armed_minutes']*60
+                        self.pause_auto=False;self.fault_blocked=False;self.save_policy()
+                        if not self.armed_until:
+                            self.auto_armed=bool(self.cfg['auto_arm'])
+                            self.armed_until=now+(60 if self.auto_armed else self.cfg['armed_minutes']*60)
                     elif op=='snapshot':self.snapshot_id=uuid.uuid4().hex;self.transient_until=max(self.transient_until,now+15)
                     elif op=='record_start':
                         if self.record_id or self.worker().get('recording'):raise ValueError('Recording already requested or active')
