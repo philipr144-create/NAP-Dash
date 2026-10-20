@@ -7,7 +7,7 @@ import unittest
 
 class CardPublishing(unittest.TestCase):
     def setUp(self):
-        root=Path(__file__).absolute().parents[2]
+        root=Path(__file__).resolve().parents[2] / "openpilot"
         tree=ast.parse((root/'selfdrive/car/card.py').read_text())
         method=next(n for cls in tree.body if isinstance(cls,ast.ClassDef) and cls.name=='Car'
                     for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='controls_update')

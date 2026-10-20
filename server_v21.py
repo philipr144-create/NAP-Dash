@@ -1211,6 +1211,12 @@ def read_params():
             except Exception:
                 r["speed_trim"] = 0.0
             
+        try:
+            pitch_index = int(pm.get("NAPPitchAssistMode", return_default=True) or 0)
+        except (TypeError, ValueError, OSError):
+            pitch_index = 0
+        r["pitch_assist_mode"] = ("off", "monitor", "on")[pitch_index] if pitch_index in (0, 1, 2) else "off"
+        r["pitch_assist_verified"] = nap_file.get("pitch_assist_verified") is True
         r["personality"] = PERSONALITIES.get(r["personality_raw"], "unknown")
         return r
     except:
@@ -1586,6 +1592,13 @@ def write_setting(name, value):
         elif name in ("adaptive_accel", "experimental"):
             pm.put_bool(PARAMS[name], bool(value))
             
+        elif name == "pitch_assist_mode":
+            requested = str(value).lower()
+            modes = {"off": 0, "monitor": 1, "on": 2}
+            if requested not in modes:
+                raise ValueError("Invalid pitch assist mode")
+            pm.put("NAPPitchAssistMode", modes[requested])
+
         elif name == "speed_trim":
             v = max(-15.0, min(15.0, float(value)))
 
@@ -1988,6 +2001,11 @@ select.cam-drop{background:#1a222e;color:var(--t);border:1px solid #344153;paddi
       <div class=label>Toggles</div>
       <div class=row><div><b>Experimental Mode</b></div><button id=exp class=switch onclick="toggle('experimental')"><i></i></button></div>
       <div class=row><div><b>Adaptive Accel</b></div><button id=ada class=switch onclick="toggle('adaptive_accel')"><i></i></button></div>
+      <div class=row><div><b>Legacy Pitch Sensor Assist</b><div class=small>Separate from V9e Predictive Grade Assist</div></div>
+        <select id="pitch-mode" onchange="setv('pitch_assist_mode',this.value)" style="max-width:145px">
+          <option value="off">OFF</option><option value="monitor">MONITOR</option><option value="on">ON</option>
+        </select></div>
+      <div class=small id="pitch-note">Pitch assistance is disabled.</div>
       <div class=row><div><b>+5 MPH Speed Offset</b></div><button id=spd class=switch onclick="toggle('speed_offset')"><i></i></button></div>
       <div class=row><div><b>Speed Trim</b><div class=small id="trim-val">0 MPH</div></div>
       <div style="display:flex;gap:5px">
@@ -2590,6 +2608,15 @@ function render(s){
     document.querySelectorAll("#follow button").forEach(b => b.classList.toggle("active", +b.dataset.val === f_dist));
     document.querySelectorAll(".p-btn").forEach(b=>b.classList.toggle("active",+b.dataset.val===p));
     sw("exp", q.experimental); sw("ada", q.adaptive_accel); sw("spd", q.speed_offset);
+    let pitchSelect = $("pitch-mode");
+    if (pitchSelect) pitchSelect.value = q.pitch_assist_mode || "off";
+    let pitchNote = $("pitch-note");
+    if (pitchNote) pitchNote.textContent =
+      q.pitch_assist_mode === "on" && !q.pitch_assist_verified ?
+        "ON LOCKED: pitch-sign validation pending. No additional torque." :
+      q.pitch_assist_mode === "monitor" ? "Monitor only; no pitch acceleration command." :
+      q.pitch_assist_mode === "on" ? "ON selected. Works after re-engagement only on verified open road." :
+        "Pitch assistance disabled.";
     
     let elTrim = $("trim-val");
     if(elTrim) elTrim.textContent = (Number(q.speed_trim || 0) > 0 ? "+" : "") + Number(q.speed_trim || 0).toFixed(0) + " MPH";
