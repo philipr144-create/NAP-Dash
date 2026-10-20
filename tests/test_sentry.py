@@ -38,7 +38,7 @@ class SafetyTests(Base):
         self.sm.valid={k:True for k in self.sm};self.sm.recv_time={k:100 for k in self.sm}
     def test_safety_guards(self):
         self.assertEqual(n.safety(self.sm,101),'')
-        for field,value in [('started',True),('thermalStatus','yellow'),('maxTempC',60),('maxTempC',float('nan'))]:
+        for field,value in [('started',True),('thermalStatus','yellow'),('maxTempC',c.DEFAULTS['suspend_c']),('maxTempC',float('nan'))]:
             old=getattr(self.sm['deviceState'],field);setattr(self.sm['deviceState'],field,value);self.assertTrue(n.safety(self.sm,101));setattr(self.sm['deviceState'],field,old)
         self.assertTrue(n.safety(self.sm,104))
         self.sm['pandaStates'][0].ignitionCan=True;self.assertTrue(n.safety(self.sm,101))
@@ -52,6 +52,18 @@ class SafetyTests(Base):
         c.atomic(c.RECORD_LEASE,{'until':now+3});self.assertTrue(c.enabled(resource='encoder'))
         c.atomic(c.RECORD_LEASE,{'until':'corrupt'});self.assertFalse(c.enabled(resource='encoder'))
         c.atomic(c.LEASE,{'until':now-1,'deadline':now+300,'live':True});self.assertFalse(c.enabled(resource='encoder'))
+    def test_parked_thermal_ceiling(self):
+        self.assertEqual(c.DEFAULTS['warn_c'],70)
+        self.assertEqual(c.DEFAULTS['suspend_c'],75)
+        self.sm['deviceState'].maxTempC=74.9
+        self.assertEqual(n.safety(self.sm,101),'')
+        self.sm['deviceState'].maxTempC=75
+        self.assertEqual(n.safety(self.sm,101),'Device too warm')
+        for status in ('yellow','red','danger'):
+            self.sm['deviceState'].maxTempC=40
+            self.sm['deviceState'].thermalStatus=status
+            self.assertEqual(n.safety(self.sm,101),'Device too warm')
+        with self.assertRaises(ValueError):c.validate_config({'suspend_c':76})
     def test_settings_bounds(self):
         for changes in ({'suspend_c':100},{'fps':60},{'storage_mb':99999},{'confirmation_frames':1},{'warn_c':60,'suspend_c':55},{'width':641},{'clip_seconds':60,'max_clip_seconds':30},{'fps':True}):
             with self.assertRaises(ValueError):c.validate_config(changes)
@@ -184,11 +196,11 @@ class AutomaticTests(Base):
         self.assertFalse(self.obj.armed_until)
     def test_thermal_resume_needs_cooling_and_stable_safety(self):
         self.obj.armed_until=500;self.obj.auto_armed=True
-        self.obj.safe=False;self.obj.reason='Device too warm';self.obj.metrics['max_c']=60
+        self.obj.safe=False;self.obj.reason='Device too warm';self.obj.metrics['max_c']=c.DEFAULTS['suspend_c']
         self.obj.update_auto(100,True);self.obj.off();self.obj.cooldown=0
-        self.obj.safe=True;self.obj.reason='';self.obj.metrics['max_c']=59
+        self.obj.safe=True;self.obj.reason='';self.obj.metrics['max_c']=c.DEFAULTS['warn_c']+1
         self.obj.update_auto(200,True);self.obj.update_auto(300,True);self.assertFalse(self.obj.armed_until)
-        self.obj.metrics['max_c']=50;self.obj.update_auto(400,True)
+        self.obj.metrics['max_c']=c.DEFAULTS['warn_c']-5;self.obj.update_auto(400,True)
         self.obj.update_auto(459,True);self.assertFalse(self.obj.armed_until)
         self.obj.update_auto(460,True);self.assertTrue(self.obj.auto_armed)
     def test_auto_setting_persisted(self):

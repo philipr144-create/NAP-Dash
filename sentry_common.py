@@ -20,11 +20,11 @@ POLICY = Path('/data/nap_sentry/policy.json')
 RETENTION_SECONDS = 24 * 60 * 60
 DEFAULTS = dict(auto_arm=1, analysis_fps=2, pixel_threshold=18, changed_fraction=.035, confirmation_frames=3,
                 brightness_jump=25, clip_seconds=30, max_clip_seconds=120, cooldown_seconds=15,
-                storage_mb=512, reserve_mb=1024, warn_c=55, suspend_c=60, armed_minutes=30,
+                storage_mb=512, reserve_mb=1024, warn_c=70, suspend_c=75, armed_minutes=30,
                 width=640, height=360, fps=10, bitrate=500000)
 LIMITS = dict(auto_arm=(0,1), analysis_fps=(1,2), pixel_threshold=(8,80), changed_fraction=(.005,.5), confirmation_frames=(2,6),
               brightness_jump=(10,60), clip_seconds=(10,60), max_clip_seconds=(30,180), cooldown_seconds=(5,120),
-              storage_mb=(64,2048), reserve_mb=(512,4096), warn_c=(45,60), suspend_c=(50,65), armed_minutes=(5,120),
+              storage_mb=(64,2048), reserve_mb=(512,4096), warn_c=(45,70), suspend_c=(50,75), armed_minutes=(5,120),
               width=(320,1280), height=(240,720), fps=(5,15), bitrate=(200000,2000000))
 
 def validate_config(changes, base=None):

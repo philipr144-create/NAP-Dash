@@ -32,7 +32,7 @@ The camera hardware still captures its native streams. Lower motion-analysis rat
 
 - Valid device/panda/peripheral messages no older than three seconds; known panda; ignition off and `deviceState.started == false`.
 - Existing `IsOnroad`, `DoShutdown`, and `DoReboot` requests are respected, never changed.
-- Existing hardware thermal status must remain green. At 55 °C device max, analysis reduces to 1 fps; at 60 °C security suspends. Configurable suspension is capped at 65 °C. Discovered sensor readings are displayed; gating uses openpilot's `deviceState.maxTempC` and thermal status. Some thermal-zone entries are virtual/control values rather than the temperature used by hardwared.
+- Existing hardware thermal status must remain green. At 70 °C device max, analysis reduces to 1 fps; at 75 °C security suspends. Configurable suspension is capped at 75 °C, matching the installed openpilot offroad danger threshold; hardwared remains unchanged. Discovered sensor readings are displayed; gating uses openpilot's `deviceState.maxTempC` and thermal status. Some thermal-zone entries are virtual/control values rather than the temperature used by hardwared.
 - Supply 12–16 V, or the verified bench exception of 4.75–5.25 V only with every panda reporting a disconnected vehicle harness. Upstream battery voltage behind regulated power is not inferred from a 5 V reading.
 - Security lease lifetime three seconds. Failed/stalled Dash monitoring releases demand. The manager independently rejects Sentry predicates when started/onroad.
 - `/data/nap_sentry/events` is separate from driving logs. Default allowance 512 MB, free-space reserve 1 GB, hard event-count limit 1,000. Oldest unprotected finalized events are removed first. Active clips cannot be deleted. If protected files or low free space prevent pruning, new recording is refused/stopped.
@@ -75,7 +75,7 @@ cd /data/server
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
 ```
 
-Thirty-one regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
+Thirty-two regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
 
 Actual comma bench checks also passed: low-rate camera sampling without encoder; real user hand movement triggered a finalized front-camera clip (313 decoded frames, 640×360/10 fps, about 2 MB); real snapshot; manual clip; simultaneous physical three-camera WebRTC frames; heartbeat/disconnect cleanup preserving arming; browser event playback; private thumbnails/video and range requests; protect/unprotect/delete; decodable interrupted H264 recovery; and disarm resource release.
 
