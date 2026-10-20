@@ -28,3 +28,10 @@ tests/*
 !/sentry-process-config.patch
 !tests/test_sentry.py
 !tests/test_sentry_api.py
+
+!/sentry_common.py
+!/sentry_worker.py
+!/sentry_encoder.py
+!/sentry_page.py
+!/sentry-v1-to-v2.patch
+!/sentry-encoder.patch

@@ -1,0 +1,72 @@
+diff --git a/system/loggerd/encoderd.cc b/system/loggerd/encoderd.cc
+index 9d4b81a3f..160a178cf 100644
+--- a/system/loggerd/encoderd.cc
++++ b/system/loggerd/encoderd.cc
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <algorithm>
+ 
+ #include "system/loggerd/loggerd.h"
+ #include "system/loggerd/encoder/jpeg_encoder.h"
+@@ -12,6 +13,8 @@
+ #endif
+ 
+ ExitHandler do_exit;
++// This flag is set only by the separate parked Sentry encoder invocation.
++bool sentry_mode = false;
+ 
+ struct EncoderdState {
+   int max_waiting = 0;
+@@ -54,6 +57,7 @@ void encoder_thread(EncoderdState *s, const LogCameraInfo &cam_info) {
+   std::unique_ptr<JpegEncoder> jpeg_encoder;
+ 
+   int cur_seg = 0;
++  uint64_t next_sentry_timestamp = 0;
+   while (!do_exit) {
+     if (!vipc_client.connect(false)) {
+       util::sleep_for(5);
+@@ -98,6 +102,12 @@ void encoder_thread(EncoderdState *s, const LogCameraInfo &cam_info) {
+       }
+       if (do_exit) break;
+ 
++      if (sentry_mode) {
++        if (extra.timestamp_eof < next_sentry_timestamp) continue;
++        const uint64_t period = 1000000000ULL / cam_info.fps;
++        next_sentry_timestamp = std::max(next_sentry_timestamp + period, extra.timestamp_eof + period / 2);
++      }
++
+       // do rotation if required
+       const int frames_per_seg = SEGMENT_LENGTH * MAIN_FPS;
+       if (cur_seg >= 0 && extra.frame_id >= ((cur_seg + 1) * frames_per_seg) + s->start_frame_id) {
+@@ -161,7 +171,30 @@ int main(int argc, char* argv[]) {
+   }
+   if (argc > 1) {
+     std::string arg1(argv[1]);
+-    if (arg1 == "--stream") {
++    if (arg1 == "--sentry") {
++      sentry_mode = true;
++      auto bounded = [](const char *name, int fallback, int low, int high) {
++        const char *value = getenv(name);
++        return std::clamp(value ? atoi(value) : fallback, low, high);
++      };
++      const int width = bounded("NAP_SENTRY_WIDTH", 640, 320, 1280) & ~1;
++      const int height = bounded("NAP_SENTRY_HEIGHT", 360, 240, 720) & ~1;
++      const int fps = bounded("NAP_SENTRY_FPS", 10, 5, 15);
++      const int bitrate = bounded("NAP_SENTRY_BITRATE", 500000, 200000, 2000000);
++      LogCameraInfo cameras[] = {stream_road_camera_info, stream_wide_road_camera_info, stream_driver_camera_info};
++      for (auto &camera : cameras) {
++        camera.fps = fps;
++        for (auto &encoder : camera.encoder_infos) {
++          encoder.frame_width = width;
++          encoder.frame_height = height;
++          encoder.fps = fps;
++          encoder.get_settings = [bitrate](int) {
++            return EncoderSettings{.encode_type = cereal::EncodeIndex::Type::QCAMERA_H264, .bitrate = bitrate, .gop_size = 10};
++          };
++        }
++      }
++      encoderd_thread(cameras);
++    } else if (arg1 == "--stream") {
+       encoderd_thread(stream_cameras_logged);
+     } else {
+       LOGE("Argument '%s' is not supported", arg1.c_str());

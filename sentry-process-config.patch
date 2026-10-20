@@ -9,7 +9,7 @@
  WEBCAM = os.getenv("USE_WEBCAM") is not None
  
  def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
-@@ -14,6 +16,16 @@
+@@ -14,6 +16,19 @@
  
  def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
    return started and CP.notCar
@@ -18,20 +18,19 @@
 +  return driverview(started, params, CP) or sentry_enabled(started)
 +
 +def sentry_stream(started: bool, params: Params, CP: car.CarParams) -> bool:
-+  return notcar(started, params, CP) or sentry_enabled(started)
++  return sentry_enabled(started, 'encoder')
 +
 +def sentry_only(started: bool, params: Params, CP: car.CarParams) -> bool:
++  return sentry_enabled(started, 'live')
++
++def sentry_monitor(started: bool, params: Params, CP: car.CarParams) -> bool:
 +  return sentry_enabled(started)
 +
  
  def iscar(started: bool, params: Params, CP: car.CarParams) -> bool:
    return started and not CP.notCar
-@@ -66,11 +78,11 @@
- 
-   NativeProcess("loggerd", "system/loggerd", ["./loggerd"], logging),
-   NativeProcess("encoderd", "system/loggerd", ["./encoderd"], only_onroad),
--  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
-+  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], sentry_stream),
+@@ -69,8 +84,8 @@
+   NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
    PythonProcess("logmessaged", "system.logmessaged", always_run),
  
 -  NativeProcess("camerad", "system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
@@ -41,10 +40,12 @@
    PythonProcess("proclogd", "system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
    PythonProcess("journald", "system.journald", only_onroad, platform.system() != "Darwin"),
    PythonProcess("micd", "system.micd", iscar),
-@@ -110,6 +122,7 @@
+@@ -110,6 +125,9 @@
    PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
    PythonProcess("server_v21", "server.server_v21", always_run, restart_if_crash=True),
    PythonProcess("nap_tailscaled", "server.tailscaled_daemon", always_run),
++  PythonProcess("nap_sentry_monitor", "server.sentry_worker", sentry_monitor),
++  PythonProcess("nap_sentry_encoder", "server.sentry_encoder", sentry_stream),
 +  PythonProcess("nap_sentry_webrtc", "server.nap_sentry", sentry_only),
    # debug procs
    NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),

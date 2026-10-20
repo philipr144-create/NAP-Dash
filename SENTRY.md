@@ -1,31 +1,84 @@
-# NAP Sentry
+# NAP Sentry V2
 
-Parked live viewing of the comma's front, wide-front, and cabin cameras simultaneously. The user verified all three physical feeds and browser PIN remembering on 20 October 2026.
+Parked security for NAP Dash on comma 3: front-camera motion events and manual evidence, plus simultaneous front/wide-front/cabin WebRTC viewing. No object recognition, neural inference, tracking, pre-event buffer, driving parameters, or shutdown overrides.
 
-Open NAP Dash → Sentry. The configured default PIN is `000000`; leave “Remember on this browser” checked to save it after the first successful Start. “Forget PIN” removes the saved browser value. Stop ends the session; select All cameras or a single focused view. A single focused view still receives all three streams. Remote video requires direct private/Tailscale access to the comma; a page tunnel alone does not relay media.
+## Use
 
-The runtime PIN is stored separately at `/data/nap_sentry_pin` with mode 0600 and is not included in this repository or backup. A fresh install creates the default PIN. Signaling is PIN protected and WebRTC listens only on loopback port 5002. No driving/control data bridges are enabled.
+Open **NAP Dash → Sentry**. Use the existing PIN (`000000` by user request). The existing “Remember on this browser” setting is preserved. Connect displays actual sensor, storage, and safety status.
 
-## Required integration
+- **Arm / Disarm:** Start/stop parked monitoring. Default armed session is 30 minutes, configurable to 5–120 minutes. Arming does not extend an existing armed deadline. Every reboot starts disarmed. Suspensions require explicit rearming after conditions become safe.
+- **Live view / Stop live view:** Connect all three cameras on demand. Five minute absolute limit, 20 second lost-heartbeat timeout. Ending live view leaves an independently armed monitor running. Disarm stops all security activity.
+- **Snapshot:** Save a low-resolution grayscale front-camera image without requiring streaming or video encoding.
+- **Manual record / Stop recording:** Save a front-camera MP4. Default duration/tail is 30 seconds; maximum clip duration is 120 seconds. Ongoing motion extends the tail within the maximum; trigger cooldown defaults to 15 seconds.
+- **Motion detection:** Toggle simple frame differences while armed. No neural models.
+- **Events:** Play clips, inspect thumbnails, protect/unprotect events, or delete individual events. Protect prevents automatic retention deletion, but explicit Delete still removes the selected event.
+- **Settings:** Disarm and stop live viewing before saving. Conservative limits constrain all configurable values.
 
-This installation uses `/data/openpilot/server` as a symlink to `/data/server` (this repository). Openpilot's `system/manager/process_config.py` also needs the dedicated `sentry_camera`, `sentry_stream`, `sentry_only` predicates and `nap_sentry_webrtc` process. The separate openpilot repository saves that integration. `sentry-process-config.patch` is also included here as a recovery copy. It must be applied from the openpilot repository only after `git apply --check` succeeds; do not overwrite a newer process configuration wholesale.
+Remote live media requires direct private/Tailscale connectivity to the comma. An HTTPS page tunnel alone does not relay WebRTC media. All API/evidence routes require the PIN. The WebRTC listener is loopback-only at `127.0.0.1:5002`. No unauthenticated public camera or recording endpoint is added.
 
-`server_v21.py` runs the Sentry safety monitor. `nap_sentry.py` contains the three-camera UI, PIN API, safety gate, and loopback WebRTC service. Reboot while parked after restoring or updating because the process manager caches imported Python modules. No reboot is needed merely to preserve this working version.
+## Resource states
 
-## Session protections
+`nap_sentry.py` coordinates short volatile resource leases and safety checks inside the existing Dash server. `sentry_common.py` provides validated configuration, leases, and bounded storage. `sentry_page.py` provides the native Dash interface.
 
-Ignition off and offroad; fresh valid device/panda/peripheral telemetry; thermal green and maximum temperature below 70 °C; 12–16 V supply, or 4.75–5.25 V with every panda reporting a disconnected harness for bench testing. Five minute absolute maximum, 20 second browser heartbeat timeout, three second lease lifetime, and five second restart cooldown. Existing device power/shutdown behavior remains intact. No motion detection or continuous recording.
+- **Disarmed:** No Sentry worker, Sentry encoder, Sentry WebRTC, or security camera demand. Legitimate driver view or normal onroad camera activity remains independent.
+- **Armed monitoring:** `camerad` plus `server.sentry_worker`. The worker samples existing VisionIPC NV12 luma at 1–2 fps, downsamples before processing, blurs, compensates median brightness shifts, rejects isolated pixel noise, and requires consecutive motion confirmation. No encoding runs merely to monitor motion.
+- **Recording:** `server.sentry_encoder` execs the existing hardware `encoderd --sentry`, with a parked-only bounded profile. The worker waits for a keyframe, writes front-camera H264, then remuxes with the existing `ffmpeg_full` using stream copy. No software video re-encoding.
+- **Viewing:** The same parked encoder also provides all three live tracks through the existing teleoprtc/aiortc infrastructure. Recording and viewing share it.
+- **Suspended:** Invalid/stale safety data, ignition/onroad state, shutdown/reboot request, high temperature, invalid power, or worker/camera failure removes security demand. Unsafe conditions never cause an automatic rearm.
+
+The camera hardware still captures its native streams. Lower motion-analysis rate reduces analysis work, not camera hardware power. The existing stream encoder architecture starts all three hardware encoding tracks when recording or viewing, although evidence records front only. This implementation does not add separate full-resolution capture or image conversion.
+
+## Safety and storage defaults
+
+- Valid device/panda/peripheral messages no older than three seconds; known panda; ignition off and `deviceState.started == false`.
+- Existing `IsOnroad`, `DoShutdown`, and `DoReboot` requests are respected, never changed.
+- Existing hardware thermal status must remain green. At 55 °C device max, analysis reduces to 1 fps; at 60 °C security suspends. Configurable suspension is capped at 65 °C. Discovered sensor readings are displayed; gating uses openpilot's `deviceState.maxTempC` and thermal status. Some thermal-zone entries are virtual/control values rather than the temperature used by hardwared.
+- Supply 12–16 V, or the verified bench exception of 4.75–5.25 V only with every panda reporting a disconnected vehicle harness. Upstream battery voltage behind regulated power is not inferred from a 5 V reading.
+- Security lease lifetime three seconds. Failed/stalled Dash monitoring releases demand. The manager independently rejects Sentry predicates when started/onroad.
+- `/data/nap_sentry/events` is separate from driving logs. Default allowance 512 MB, free-space reserve 1 GB, hard event-count limit 1,000. Oldest unprotected finalized events are removed first. Active clips cannot be deleted. If protected files or low free space prevent pruning, new recording is refused/stopped.
+- Per-clip byte cap is the smaller of 128 MB and half the security allowance. Clip lengths and repeated trigger frequency are bounded. No encoded pre-event footage is retained; the subscriber drains unused packets.
+- Metadata is atomic JSON; active recordings use `.partial.h264`. Interrupted clips are remuxed on the next worker start when decodable, or marked failed; orphan partial files are removed only inside the security evidence directory. Finalization timeout is bounded to fit manager shutdown.
+
+Configuration lives at `/data/nap_sentry/config.json`; runtime PIN at `/data/nap_sentry_pin` (0600). Neither is tracked. Events, credentials, and private camera images are not source artifacts.
+
+## Integration and recovery
+
+`/data/openpilot/server` points to `/data/server` (NAP Dash). The openpilot repository contains two scoped changes: dedicated Sentry process conditions in `system/manager/process_config.py`, and an explicitly separate `--sentry` encoder profile in `system/loggerd/encoderd.cc`. Normal driving encoding and `--stream` paths retain their behavior. The shared `notcar` predicate is unchanged.
+
+The process-configuration and encoder patches alongside this document are recovery references. Apply only after `git apply --check` succeeds; do not overwrite newer customized files blindly. Build the encoder using the existing environment:
+
+```sh
+cd /data/openpilot
+PATH=/usr/local/venv/bin:$PATH scons -j2 system/loggerd/encoderd
+```
+
+Reboot while parked after source restoration or updates because the manager caches imported modules. Never restore the V1 encoder binary while V2 recording/viewing is active.
+
+An exact pre-V2 runtime backup, including the original encoder binary, is in `/data/nap_backups/sentry-v2-20261020/`. To return to the already working V1 system, Disarm in Dash, then restore these backed-up files to their matching locations and reboot while parked:
+
+```sh
+cp /data/nap_backups/sentry-v2-20261020/nap_sentry.py /data/server/nap_sentry.py
+cp /data/nap_backups/sentry-v2-20261020/server_v21.py /data/server/server_v21.py
+cp /data/nap_backups/sentry-v2-20261020/process_config.py /data/openpilot/system/manager/process_config.py
+cp /data/nap_backups/sentry-v2-20261020/encoderd.cc /data/openpilot/system/loggerd/encoderd.cc
+cp /data/nap_backups/sentry-v2-20261020/encoderd /data/openpilot/system/loggerd/encoderd
+```
+
+V2 helper modules and stored evidence may remain; V1 does not invoke them. This rollback preserves driving logs, the PIN, and unrelated customizations. Removing Sentry entirely requires restoring the pre-Sentry manager/server versions instead, as documented in the earlier recovery archive.
 
 ## Validation
 
-Run from this repository with the device Python environment:
+Run the consolidated suite in NAP Dash:
 
 ```sh
-/usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
+cd /data/server
+PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
 ```
 
-Eight tests cover voltage/bench limits, ignition, temperature, telemetry freshness, lease expiry and onroad rejection, PIN authentication and permissions, fixed three-camera signaling without control bridges, browser remembering, stop/reset, and non-extending session deadlines. The device's installed aiortc/teleoprtc stack also delivered correctly labeled synthetic frames on all three tracks. The user subsequently verified the three physical feeds.
+Nineteen regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
 
-## Recovery
+Actual comma bench checks also passed: low-rate camera sampling without encoder; real user hand movement triggered a finalized front-camera clip (313 decoded frames, 640×360/10 fps, about 2 MB); real snapshot; manual clip; simultaneous physical three-camera WebRTC frames; heartbeat/disconnect cleanup preserving arming; browser event playback; private thumbnails/video and range requests; protect/unprotect/delete; decodable interrupted H264 recovery; and disarm resource release.
 
-Keep NAP Dash and openpilot at the paired saved commits recorded with the recovery backup. To restore this feature from the saved Git history, restore `nap_sentry.py` and `server_v21.py` in NAP Dash and the Sentry integration in openpilot's `system/manager/process_config.py`, preserve the server symlink, and reboot while parked. The accompanying source backup includes these three working files without private runtime configuration. Existing unrelated settings, driving tuning, and camera recordings are outside this feature's backup.
+Short bench input-power samples (including a final 58.7-second monitoring sample) were approximately 1.8 W disarmed, 3.7–4.2 W monitoring, 4.3 W recording, and 4.6 W viewing with an on-device validation client. The local viewing client adds CPU/decoding load, so that figure is not a remote-phone benchmark. These are preliminary indoor samples, not summer-heat, battery endurance, or vehicle-runtime claims. See the delivered measurement report for sample durations and limits.
+
+Still required before relying on unattended vehicle security: in-car voltage characterization, ignition transition with the physical vehicle, summer/soak thermal behavior, realistic lighting/motion false-trigger tuning, long-duration parked power/endurance, and normal driving camera/encoder transition confirmation. Thermal and low-power guard logic was tested on-device with controlled test inputs; the physical device was not intentionally overheated or undervolted.

@@ -1,49 +1,148 @@
-import importlib.util
+import io
 import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
-spec=importlib.util.spec_from_file_location('sentry', str(Path(__file__).resolve().parents[1] / 'nap_sentry.py'))
-s=importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
-class SM(dict): pass
-class Tests(unittest.TestCase):
- def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory(); s.LEASE=Path(self.tmp.name)/'lease'; s.TOKEN=Path(self.tmp.name)/'token'
-  self.sm=SM(deviceState=NS(started=False,thermalStatus='green',maxTempC=40), pandaStates=[NS(ignitionLine=False,ignitionCan=False,pandaType='tres',harnessStatus='normal')],peripheralState=NS(pandaType='tres',voltage=12500))
-  self.sm.valid={k:True for k in self.sm}; self.sm.recv_time={k:100 for k in self.sm}
- def tearDown(self): self.tmp.cleanup()
- def test_safety(self):
-  self.assertEqual(s.safety(self.sm,101),'')
-  self.sm['pandaStates'][0].ignitionCan=True; self.assertTrue(s.safety(self.sm,101))
-  self.sm['pandaStates'][0].ignitionCan=False
-  for voltage in (0,4950,11999,16001):
-   self.sm['peripheralState'].voltage=voltage; self.assertTrue(s.safety(self.sm,101))
-  self.sm['peripheralState'].voltage=12500
-  self.assertTrue(s.safety(self.sm,104))
-  self.sm['deviceState'].maxTempC=70; self.assertTrue(s.safety(self.sm,101))
- def test_bench_supply(self):
-  self.sm['peripheralState'].voltage=4951
-  self.assertTrue(s.safety(self.sm,101))
-  self.sm['pandaStates'][0].harnessStatus='notConnected'
-  for voltage in (4750,4951,5000,5250):
-   self.sm['peripheralState'].voltage=voltage; self.assertEqual(s.safety(self.sm,101),'')
-  for voltage in (0,4749,5251,10000,11999):
-   self.sm['peripheralState'].voltage=voltage; self.assertTrue(s.safety(self.sm,101))
-  self.sm['peripheralState'].voltage=5000
-  self.sm['pandaStates'][0].ignitionCan=True; self.assertTrue(s.safety(self.sm,101))
-  self.sm['pandaStates'][0].ignitionCan=False
-  self.sm['deviceState'].thermalStatus='yellow'; self.assertTrue(s.safety(self.sm,101))
-  self.sm['deviceState'].thermalStatus='green'; self.assertTrue(s.safety(self.sm,104))
- def test_lease(self):
-  self.assertFalse(s.enabled()); now=time.monotonic()
-  s.LEASE.write_text(json.dumps({'until':now+3,'deadline':now+100}))
-  self.assertTrue(s.enabled()); self.assertFalse(s.enabled(True))
-  s.LEASE.write_text(json.dumps({'until':now-1,'deadline':now+100})); self.assertFalse(s.enabled())
-  s.LEASE.write_text('bad'); self.assertFalse(s.enabled())
- def test_reset_and_key(self):
-  obj=s.Sentry(); self.assertEqual(obj.token,'000000')
-  self.assertEqual(s.TOKEN.stat().st_mode & 0o777,0o600)
-  obj.deadline=time.monotonic()+100; obj.off(); self.assertEqual(obj.deadline,0)
-if __name__=='__main__': unittest.main()
+from unittest.mock import patch
+import numpy as np
+from server import sentry_common as c
+from server import nap_sentry as n
+from server.sentry_worker import Detector,Worker
+
+class Handler:
+    def __init__(self,op,pin='000000',body=None):
+        self.path='/api/sentry/'+op;self.command='GET' if body is None else 'POST'
+        raw=b'' if body is None else json.dumps(body).encode()
+        self.rfile=io.BytesIO(raw);self.headers={'Content-Type':'application/json','Content-Length':str(len(raw)),'Host':'local'}
+        if pin is not None:self.headers['Authorization']='Bearer '+pin
+    def send_json(self,d,status=200):self.result=status,d
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();r=Path(self.tmp.name)
+        self.disk=patch.object(c.shutil,'disk_usage',return_value=NS(free=10*1073741824));self.disk.start()
+        self.old={k:getattr(c,k) for k in ('LEASE','RECORD_LEASE','WORKER_STATUS','ROOT','CONFIG')};self.token=n.TOKEN
+        for k in self.old:setattr(c,k,r/k)
+        n.TOKEN=r/'pin'
+    def tearDown(self):
+        for k,v in self.old.items():setattr(c,k,v)
+        n.TOKEN=self.token;self.disk.stop();self.tmp.cleanup()
+
+class SafetyTests(Base):
+    def setUp(self):
+        super().setUp()
+        class SM(dict):pass
+        self.sm=SM(deviceState=NS(started=False,thermalStatus='green',maxTempC=40),pandaStates=[NS(pandaType='tres',ignitionLine=False,ignitionCan=False,harnessStatus='notConnected')],peripheralState=NS(pandaType='tres',voltage=5000))
+        self.sm.valid={k:True for k in self.sm};self.sm.recv_time={k:100 for k in self.sm}
+    def test_safety_guards(self):
+        self.assertEqual(n.safety(self.sm,101),'')
+        for field,value in [('started',True),('thermalStatus','yellow'),('maxTempC',60),('maxTempC',float('nan'))]:
+            old=getattr(self.sm['deviceState'],field);setattr(self.sm['deviceState'],field,value);self.assertTrue(n.safety(self.sm,101));setattr(self.sm['deviceState'],field,old)
+        self.assertTrue(n.safety(self.sm,104))
+        self.sm['pandaStates'][0].ignitionCan=True;self.assertTrue(n.safety(self.sm,101))
+    def test_power_guards(self):
+        for v in (4750,5250,12000,16000):self.sm['peripheralState'].voltage=v;self.assertEqual(n.safety(self.sm,101),'')
+        for v in (4749,5251,11000,16001):self.sm['peripheralState'].voltage=v;self.assertTrue(n.safety(self.sm,101))
+        self.sm['pandaStates'][0].harnessStatus='normal';self.sm['peripheralState'].voltage=5000;self.assertTrue(n.safety(self.sm,101))
+    def test_separate_leases(self):
+        now=time.monotonic();c.atomic(c.LEASE,{'until':now+3,'deadline':now+300,'armed':True,'live':False})
+        self.assertTrue(c.enabled());self.assertFalse(c.enabled(resource='encoder'));self.assertFalse(c.enabled(resource='live'));self.assertFalse(c.enabled(True))
+        c.atomic(c.RECORD_LEASE,{'until':now+3});self.assertTrue(c.enabled(resource='encoder'))
+        c.atomic(c.RECORD_LEASE,{'until':'corrupt'});self.assertFalse(c.enabled(resource='encoder'))
+        c.atomic(c.LEASE,{'until':now-1,'deadline':now+300,'live':True});self.assertFalse(c.enabled(resource='encoder'))
+    def test_settings_bounds(self):
+        for changes in ({'suspend_c':100},{'fps':60},{'storage_mb':99999},{'confirmation_frames':1},{'warn_c':60,'suspend_c':55},{'width':641},{'clip_seconds':60,'max_clip_seconds':30},{'fps':True}):
+            with self.assertRaises(ValueError):c.validate_config(changes)
+        self.assertEqual(c.validate_config({'analysis_fps':1})['analysis_fps'],1)
+
+class MotionTests(unittest.TestCase):
+    def warmed(self):
+        d=Detector();a=np.full((90,160),80,dtype=np.uint8)
+        for _ in range(8):self.assertFalse(d.update(a,c.DEFAULTS)[0])
+        return d,a
+    def test_local_motion_confirmation(self):
+        d,a=self.warmed();hits=[]
+        for x in (0,25,50,75):
+            b=a.copy();b[20:55,x:x+25]=180;hits.append(d.update(b,c.DEFAULTS)[0])
+        self.assertTrue(any(hits[2:]))
+    def test_global_light_and_noise(self):
+        d,a=self.warmed();hit,_,global_change=d.update(a+50,c.DEFAULTS)
+        self.assertFalse(hit);self.assertTrue(global_change)
+        rng=np.random.default_rng(4)
+        for _ in range(50):
+            b=a.copy();mask=rng.random(a.shape)<.01;b[mask]=200
+            self.assertFalse(d.update(b,c.DEFAULTS)[0])
+    def test_small_global_drift(self):
+        d,a=self.warmed()
+        for k in range(20):self.assertFalse(d.update(a+k,c.DEFAULTS)[0])
+
+class ApiTests(Base):
+    def setUp(self):super().setUp();self.obj=n.Sentry();self.obj.safe=True;self.obj.cooldown=0
+    def call(self,op,body=None,pin='000000'):
+        h=Handler(op,pin,body);self.obj.handle(h);return h.result
+    def test_auth_including_evidence(self):
+        for op in ('status','events','media/'+'a'*32+'/video','media/'+'a'*32+'/thumbnail'):
+            self.assertEqual(self.call(op,pin=None)[0],401)
+        self.assertEqual(self.call('status',pin='999999')[0],401)
+        self.assertEqual(self.call('status')[0],200)
+        self.assertEqual(n.TOKEN.stat().st_mode&0o777,0o600)
+    def test_armed_live_independence(self):
+        self.assertEqual(self.call('arm',{})[0],200);armed=self.obj.armed_until
+        self.assertEqual(self.call('start',{})[0],200);deadline=self.obj.deadline
+        self.call('start',{});self.call('ping',{});self.assertEqual(self.obj.deadline,deadline)
+        self.call('stop',{});self.assertEqual(self.obj.armed_until,armed);self.assertFalse(self.obj.deadline)
+        self.call('disarm',{});self.assertFalse(self.obj.armed_until);self.assertFalse(c.LEASE.exists())
+    def test_unsafe_no_start(self):
+        self.obj.safe=False;self.obj.reason='Too warm'
+        for op in ('arm','start','snapshot','record_start'):self.assertEqual(self.call(op,{})[0],409)
+    def test_config_only_when_idle(self):
+        self.call('arm',{});self.assertEqual(self.call('config',{'fps':5})[0],409)
+        self.call('disarm',{});self.assertEqual(self.call('config',{'fps':5})[0],200)
+    def test_offer_fixed_cameras_no_controls(self):
+        def proxy(req,timeout):
+            body=json.loads(req.data);self.assertEqual(body['cameras'],n.CAMERAS);self.assertEqual(body['bridge_services_in'],[])
+            return io.BytesIO(b'{"type":"answer","sdp":"answer"}')
+        with patch.object(c,'enabled',return_value=True),patch.object(n,'urlopen',side_effect=proxy):
+            self.assertEqual(self.call('offer',{'sdp':'offer','bridge_services_in':['carControl']})[0],200)
+    def test_browser_keeps_pin_private_from_page(self):
+        self.assertIn('localStorage.getItem(storageKey)',n.PAGE);self.assertNotIn('000000',n.PAGE)
+
+class StorageTests(Base):
+    def test_delete_validation(self):
+        store=c.Store()
+        with self.assertRaises(ValueError):store.delete('../driving-logs')
+        e=store.create('motion',b'jpg',c.DEFAULTS)
+        with self.assertRaises(ValueError):store.delete(e['id'])
+        e['state']='ready';store.metadata(e);store.delete(e['id']);self.assertFalse(store.events())
+    def test_oldest_unprotected_only(self):
+        store=c.Store();cfg=dict(c.DEFAULTS,storage_mb=1,reserve_mb=0)
+        first=store.create('snapshot',b'a'*600000,c.DEFAULTS);time.sleep(.002)
+        second=store.create('snapshot',b'b'*600000,c.DEFAULTS);second['protected']=True;store.metadata(second)
+        self.assertTrue(store.prune(cfg));self.assertFalse(store.path(first['id'],'.jpg').exists());self.assertTrue(store.path(second['id'],'.jpg').exists())
+    def test_failed_interrupted_clip(self):
+        store=c.Store();event=store.create('motion',b'thumb',c.DEFAULTS)
+        store.recover(c.DEFAULTS)
+        d=store.events()[0];self.assertEqual(d['state'],'failed');self.assertTrue(d['interrupted'])
+    def test_free_space_fail_closed(self):
+        store=c.Store()
+        with patch.object(c.shutil,'disk_usage',return_value=NS(free=100)):
+            with self.assertRaises(ValueError):store.create('motion',b'jpg',c.DEFAULTS)
+    def test_record_tail_extension_is_bounded(self):
+        worker=Worker()
+        with patch('server.sentry_worker.time.monotonic',return_value=100):worker.begin('motion')
+        self.assertEqual(worker.until,130)
+        with patch('server.sentry_worker.time.monotonic',return_value=120):worker.begin('motion')
+        self.assertEqual(worker.until,150)
+        with patch('server.sentry_worker.time.monotonic',return_value=219):worker.begin('motion')
+        self.assertEqual(worker.until,220)
+        worker.file.close();worker.file=None
+    def test_waits_for_keyframe(self):
+        worker=Worker();worker.begin('manual')
+        msg=NS(livestreamRoadEncodeData=NS(idx=NS(flags=0),header=b'',data=b'p',width=640,height=360))
+        worker.packet(msg);self.assertEqual(worker.frames,0)
+        msg.livestreamRoadEncodeData.idx.flags=8;msg.livestreamRoadEncodeData.header=b'header'
+        worker.packet(msg);self.assertEqual(worker.frames,1);worker.file.close();worker.file=None
+
+if __name__=='__main__':unittest.main()
