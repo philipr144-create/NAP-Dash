@@ -85,6 +85,11 @@ class Sentry:
         if self.cool_resume and self.metrics.get('max_c',100)>=self.cfg['warn_c']:
             self.safe_since=None
             return
+        if self.auto_armed:
+            # An already-permitted running session must renew without another
+            # startup delay, including immediately after an explicit Resume.
+            self.armed_until=now+60
+            return
         if self.safe_since is None:self.safe_since=now
         if now-self.safe_since>=self.resume_wait and now>=self.cooldown:
             # The short renewable deadline is a watchdog, not a parking session timer.
@@ -97,7 +102,7 @@ class Sentry:
         recording=bool(w.get('recording') and common.lease())
         state='suspended' if self.suspended else 'recording' if recording else 'viewing' if self.deadline else 'monitoring' if self.armed_until else 'disarmed'
         return dict(state=state,active=common.enabled(resource='live'),armed=self.armed_until>now,motion=self.motion,
-                    safe=self.safe,reason=self.reason,warning=self.metrics.get('max_c',0)>=self.cfg['warn_c'],
+                    safe=self.safe,reason=self.reason or ('Camera/monitor stopped; Resume monitoring or next drive required' if self.fault_blocked else ''),warning=self.metrics.get('max_c',0)>=self.cfg['warn_c'],
                     remaining=max(0,int(self.deadline-now)),armed_remaining=None if self.auto_armed else max(0,int(self.armed_until-now)),
                     auto_enabled=bool(self.cfg['auto_arm']),auto_armed=self.auto_armed,paused=self.pause_auto,
                     fault_blocked=self.fault_blocked,retention_hours=24,

@@ -154,6 +154,16 @@ class AutomaticTests(Base):
         self.obj.update_auto(110,True);self.assertTrue(self.obj.auto_armed)
         self.obj.update_auto(3600,True);self.assertEqual(self.obj.armed_until,3660)
         self.assertIsNone(self.obj.status()['armed_remaining'])
+    def test_explicit_resume_has_no_one_minute_lease_gap(self):
+        self.obj.resume_wait=60
+        with patch('server.nap_sentry.time.monotonic',return_value=100):
+            self.obj.handle(Handler('arm',body={}))
+        self.assertTrue(self.obj.auto_armed)
+        self.obj.update_auto(100.4,True)
+        self.obj.update_auto(160,True)
+        self.assertGreater(self.obj.armed_until,160)
+        self.obj.update_auto(3600,True)
+        self.assertEqual(self.obj.armed_until,3660)
     def test_drive_stops_and_next_park_rearms(self):
         self.obj.pause_auto=True;self.obj.fault_blocked=True;self.obj.save_policy()
         self.obj.update_auto(100,False,driving=True)
