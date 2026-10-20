@@ -22,3 +22,9 @@ tests/*
 
 !/airride_diagnostics.py
 !tests/test_airride_diagnostics.py
+
+!/nap_sentry.py
+!/SENTRY.md
+!/sentry-process-config.patch
+!tests/test_sentry.py
+!tests/test_sentry_api.py
