@@ -1,0 +1,23 @@
+diff --git a/system/manager/process_config.py b/system/manager/process_config.py
+index e7f64f505..42104382c 100644
+--- a/system/manager/process_config.py
++++ b/system/manager/process_config.py
+@@ -26,6 +26,9 @@ def sentry_stream(started: bool, params: Params, CP: car.CarParams) -> bool:
+ def sentry_only(started: bool, params: Params, CP: car.CarParams) -> bool:
+   return sentry_enabled(started, 'live')
+ 
++def sentry_sensors(started: bool, params: Params, CP: car.CarParams) -> bool:
++  return only_onroad(started, params, CP) or sentry_enabled(started, 'sensors')
++
+ def sentry_monitor(started: bool, params: Params, CP: car.CarParams) -> bool:
+   return sentry_enabled(started)
+ 
+@@ -94,7 +97,7 @@ procs = [
+   PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),
+   PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
+ 
+-  PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=not PC),
++  PythonProcess("sensord", "system.sensord.sensord", sentry_sensors, enabled=not PC),
+   PythonProcess("ui", "selfdrive.ui.ui", always_run, restart_if_crash=True),
+   PythonProcess("soundd", "selfdrive.ui.soundd", only_onroad),
+   PythonProcess("locationd", "selfdrive.locationd.locationd", only_onroad),

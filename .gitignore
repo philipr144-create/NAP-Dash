@@ -35,3 +35,8 @@ tests/*
 !/sentry_page.py
 !/sentry-v1-to-v2.patch
 !/sentry-encoder.patch
+
+!sentry_bump.py
+!sentry_buffer.py
+!tests/test_bump_buffer.py
+!sentry-bump-buffer-process.patch

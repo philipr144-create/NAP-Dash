@@ -25,11 +25,11 @@ def video_suffix(camera='road', partial=False):
     return ('' if camera=='road' else '.'+camera) + ('.partial.h264' if partial else '.mp4')
 
 RETENTION_SECONDS = 24 * 60 * 60
-DEFAULTS = dict(auto_arm=1, cabin_motion=0, analysis_fps=2, pixel_threshold=10, changed_fraction=.008, confirmation_frames=2,
+DEFAULTS = dict(auto_arm=1, cabin_motion=0, bump_detection=1, bump_threshold_g=.35, prebuffer_seconds=10, analysis_fps=2, pixel_threshold=10, changed_fraction=.008, confirmation_frames=2,
                 brightness_jump=25, clip_seconds=30, max_clip_seconds=120, cooldown_seconds=15,
                 storage_mb=512, reserve_mb=1024, warn_c=70, suspend_c=75, armed_minutes=30,
                 width=640, height=360, fps=10, bitrate=500000)
-LIMITS = dict(auto_arm=(0,1), cabin_motion=(0,1), analysis_fps=(1,2), pixel_threshold=(8,80), changed_fraction=(.005,.5), confirmation_frames=(2,6),
+LIMITS = dict(auto_arm=(0,1), cabin_motion=(0,1), bump_detection=(0,1), bump_threshold_g=(.15,1.5), prebuffer_seconds=(0,20), analysis_fps=(1,2), pixel_threshold=(8,80), changed_fraction=(.005,.5), confirmation_frames=(2,6),
               brightness_jump=(10,60), clip_seconds=(10,60), max_clip_seconds=(30,180), cooldown_seconds=(5,120),
               storage_mb=(64,2048), reserve_mb=(512,4096), warn_c=(45,70), suspend_c=(50,75), armed_minutes=(5,120),
               width=(320,1280), height=(240,720), fps=(5,15), bitrate=(200000,2000000))
@@ -86,12 +86,15 @@ def enabled(started=False, resource='camera'):
     d = lease()
     if not d:
         return False
+    cfg=d.get('config',{})
+    if resource == 'sensors':
+        return bool(d.get('armed') and cfg.get('bump_detection',0))
     if resource == 'live':
         return bool(d.get('live', False))
     if resource == 'encoder':
         r = read(RECORD_LEASE)
         until=r.get('until',0)
-        return bool(d.get('live', False) or (isinstance(until,(int,float)) and time.monotonic() < until <= time.monotonic()+4))
+        return bool(d.get('live', False) or (d.get('armed') and cfg.get('prebuffer_seconds',0)>0) or (isinstance(until,(int,float)) and time.monotonic() < until <= time.monotonic()+4))
     return True
 
 class Store:
@@ -190,9 +193,11 @@ class Store:
         starts=[t['start_mono_ns'] for t in tracks.values() if t.get('start_mono_ns')]
         if starts:
             origin=min(starts)
+            if d.get('trigger_mono_ns'):d['trigger_offset_s']=round(max(0,(d['trigger_mono_ns']-origin)/1e9),3)
             for t in tracks.values():t['offset_s']=round((t.get('start_mono_ns',origin)-origin)/1e9,4)
         d.update(cameras=tracks,state='ready' if ready else 'failed',bytes=total,complete=ready==len(tracks))
         if ready<len(tracks):d['error']='One or more cameras unavailable; available views preserved'
+        d['protected']=read(self.path(d['id'],'.json')).get('protected',d['protected'])
         self.metadata(d)
     def recover(self, cfg):
         for d in self.events():

@@ -1,6 +1,6 @@
 # NAP Sentry V2
 
-Parked security for NAP Dash on comma 3: motion events from any camera and grouped front/wide-front/cabin evidence, plus simultaneous front/wide-front/cabin WebRTC viewing. No object recognition, neural inference, tracking, pre-event buffer, driving parameters, or shutdown overrides.
+Parked security for NAP Dash on comma 3: motion events from any camera and grouped front/wide-front/cabin evidence, plus simultaneous front/wide-front/cabin WebRTC viewing. No object recognition, neural inference, tracking, driving parameters, or shutdown overrides.
 
 ## Use
 
@@ -21,7 +21,7 @@ Remote live media requires direct private/Tailscale connectivity to the comma. A
 `nap_sentry.py` coordinates short volatile resource leases and safety checks inside the existing Dash server. `sentry_common.py` provides validated configuration, leases, and bounded storage. `sentry_page.py` provides the native Dash interface.
 
 - **Disarmed:** No Sentry worker, Sentry encoder, Sentry WebRTC, or security camera demand. Legitimate driver view or normal onroad camera activity remains independent.
-- **Armed monitoring:** `camerad` plus `server.sentry_worker`. The worker samples existing VisionIPC NV12 luma at 1–2 fps, downsamples before processing, blurs, compensates median brightness shifts, rejects isolated pixel noise, and requires consecutive motion confirmation. No encoding runs merely to monitor motion.
+- **Armed monitoring:** `camerad` plus `server.sentry_worker`. The worker samples existing VisionIPC NV12 luma at 1–2 fps, downsamples before processing, blurs, compensates median brightness shifts, rejects isolated pixel noise, and requires consecutive motion confirmation. With the pre-event buffer disabled, no encoding runs merely to monitor motion.
 - **Recording:** `server.sentry_encoder` execs the existing hardware `encoderd --sentry`, with a parked-only bounded profile. The worker waits for a keyframe, writes all three camera H264 streams, then remuxes with the existing `ffmpeg_full` using stream copy. No software video re-encoding.
 - **Viewing:** The same parked encoder also provides all three live tracks through the existing teleoprtc/aiortc infrastructure. Recording and viewing share it.
 - **Suspended:** Invalid/stale safety data, ignition/onroad state, shutdown/reboot request, high temperature, invalid power, or worker/camera failure removes security demand. No automatic restart occurs while conditions remain unsafe. Safe thermal/power recovery is delayed and uses temperature hysteresis; camera/worker faults are latched for the parking period.
@@ -75,7 +75,7 @@ cd /data/server
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
 ```
 
-Forty-three regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
+Sixty-three regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
 
 Actual comma bench checks also passed: low-rate camera sampling without encoder; real user hand movement triggered a finalized front-camera clip (313 decoded frames, 640×360/10 fps, about 2 MB); real snapshot; manual clip; simultaneous physical three-camera WebRTC frames; heartbeat/disconnect cleanup preserving arming; browser event playback; private thumbnails/video and range requests; protect/unprotect/delete; decodable interrupted H264 recovery; and disarm resource release.
 
@@ -95,10 +95,24 @@ To roll back this update to manual/timed V2, restore `nap_sentry.py`, `sentry_co
 
 Motion analysis samples front and wide front independently, plus cabin when its optional toggle is enabled. A trigger from an enabled view starts the same bounded event on all three hardware H264 streams. Default sensitivity is 10 luma levels, 0.8% spatially supported change, and two confirmations, with a short background comparison for small/dark moving objects. Uniform exposure jumps and isolated sensor noise remain suppressed; passing headlights without a visible object are not guaranteed triggers. Darkness and distance still limit detection.
 
-Each event includes per-camera keyframe timestamps, frame counts, offsets, and availability. Dash presents three labeled views with one Play/Pause and seek timeline; offsets use camera capture timestamps. Missing/failed cameras are labeled and do not discard usable evidence. Old front-only clips remain playable. Thumbnails and snapshots remain front-only. There is no continuous recording or pre-event footage.
+Each event includes per-camera keyframe timestamps, frame counts, offsets, and availability. Dash presents three labeled views with one Play/Pause and seek timeline; offsets use camera capture timestamps. Missing/failed cameras are labeled and do not discard usable evidence. Old front-only clips remain playable. Thumbnails and snapshots remain front-only. The optional pre-event buffer retains bounded compressed video in RAM; disk evidence is written only for events.
 
 The motion activity tile reports each camera score; its tooltip includes the threshold and last detection. Temperature, ignition, voltage, quotas, and 24-hour retention apply to the grouped event. Three video tracks consume more event storage than the previous front-only clips.
 
 ## Cabin motion toggle
 
 **Cabin motion detection** defaults off and is saved in configuration (`cabin_motion: 0` or `1`). It can be changed while monitoring or viewing, without disarming. Front/wide-front triggers and manual events continue to record all three cameras with either setting. Switching the toggle off resets cabin detection history; switching it on starts a fresh warmup. Global Motion detection still controls every motion trigger. Existing recordings are unaffected.
+
+## Bump triggers and buffered events
+
+Bump detection defaults on, with adjustable dynamic-acceleration threshold 0.35 g (allowed 0.15–1.5 g). A three-second/100-sample settling interval estimates gravity. Two threshold crossings within 40 ms or a single twice-threshold hit trigger an event; ten seconds of sensor cooldown suppresses vibration retriggers. Invalid/non-finite, duplicate, future, and >200 ms old samples cannot trigger. A >250 ms sample gap starts a fresh settling interval. The native 104 Hz accelerometer uses m/s² and its original ±2 g range is unchanged. Door slams can trigger; actual sensitivity at the vehicle mounting point needs physical validation. Sensor failure is shown explicitly while camera-based monitoring continues. This is an impact/jolt trigger, not tow detection or a calibrated crash detector.
+
+The existing sensord service now also runs for a fresh, armed Sentry lease with bump detection enabled. Its original onroad predicate remains authoritative while driving. No driving state, control, shutdown, thermal, or voltage setting is overridden.
+
+The optional pre-event buffer defaults to 10 seconds (0 disables; maximum 20). It keeps compressed H264 from all three existing hardware encoding tracks in RAM, never continuous disk footage. Each ring is limited to 8 MiB, 24 MiB total payload, and the configured interval plus at most three seconds of keyframe margin. Actual pre-event coverage depends on encoder warmup, keyframes, and available data and is stored per camera. Pausing/security shutdown releases the worker and its buffers; disabling buffering clears the rings on its next loop.
+
+Buffering keeps the parked hardware encoder running while armed. It adds power/heat compared with monitoring without encoding. Existing 70/75°C and power guards remain in force. Buffer fill, bump sensor readiness, and current dynamic acceleration are visible in Dash. Toggle bump detection or buffering without disarming; threshold and buffer length use the existing idle-only Settings save.
+
+Motion, bumps, and manual events share one grouped three-camera clip. A bump during an existing event adds a Bump detected label and extends the post-trigger tail within the existing maximum. Bump triggers bypass the visual event cooldown and have their own sensor cooldown. The normal tail is 30 seconds and maximum post-trigger span is 120 seconds; pre-event footage is additional. The event timeline shows the trigger offset and actual saved pre-event duration. Existing retention, protection, authentication, and storage limits apply to the whole event.
+
+Clip remuxing uses one bounded background finalizer so accelerometer sampling and RAM buffering continue while a completed event is packaged. Protection changes made during finalization are preserved.

@@ -3,8 +3,11 @@ import io
 import os
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from server import sentry_common as common
+from server.sentry_bump import BumpDetector
+from server.sentry_buffer import Packet, VideoRing
 
 class Detector:
     def __init__(self):
@@ -65,6 +68,8 @@ class Worker:
         self.event=None;self.file=None;self.until=0;self.record_start=0;self.last_motion=0
         self.cooldown=0;self.last_frame=0;self.last_packet=0;self.last_sample=0;self.last_status=0
         self.score=0.;self.brightness=False;self.thumbnail=None;self.last_snapshot='';self.last_manual='';self.last_stop=0
+        self.rings={c:VideoRing() for c in common.CAMERAS};self.buffer_enabled=False
+        self.bump=BumpDetector();self.bump_enabled=False;self.finalizer=None;self.finalizing=None
         self.gray=None;self.error='';self.frames=0;self.stopping=False;self.last_space=0;self.space_ok=True
     def analyze(self,camera,gray,enabled):
         # Disabling a trigger source leaves its recording/live track untouched.
@@ -73,21 +78,32 @@ class Worker:
             self.detectors[camera]=Detector()
             return False,0.,False
         return self.detectors[camera].update(gray,self.cfg)
+    def event_metadata(self):
+        self.event['protected']=common.read(self.store.path(self.event['id'],'.json')).get('protected',self.event['protected'])
+        self.store.metadata(self.event)
     def begin(self,kind):
         now=time.monotonic()
         if self.event:
-            if kind=='motion':self.until=min(self.record_start+self.cfg['max_clip_seconds'],now+self.cfg['clip_seconds'])
+            if kind in ('motion','bump'):
+                self.until=min(self.record_start+self.cfg['max_clip_seconds'],now+self.cfg['clip_seconds'])
+                if kind not in self.event['triggers']:self.event['triggers'].append(kind)
+                if kind=='bump':self.event['bump_peak_g']=round(max((self.event.get('bump_peak_g') or 0),self.bump.current_g),3)
+                self.event_metadata()
             return
-        if now < self.cooldown:
+        if now < self.cooldown and kind!='bump':
             return
         try:
             self.event=self.store.create(kind,jpeg(self.gray) if self.gray is not None else None,self.cfg)
-            self.event.update(fps=self.cfg['fps'],width=self.cfg['width'],height=self.cfg['height'],trigger_camera=self.trigger_camera if kind=='motion' else None,cameras={c:dict(state='recording',frames=0) for c in common.CAMERAS})
-            self.store.metadata(self.event)
+            self.event.update(fps=self.cfg['fps'],width=self.cfg['width'],height=self.cfg['height'],trigger_camera=self.trigger_camera if kind=='motion' else None,triggers=[kind],trigger_mono_ns=int(now*1e9),bump_peak_g=round(self.bump.current_g,3) if kind=='bump' else None,cameras={c:dict(state='recording',frames=0) for c in common.CAMERAS})
+            self.event_metadata()
             self.files={c:self.store.path(self.event['id'],common.video_suffix(c,True)).open('wb') for c in common.CAMERAS}
             self.file=self.files['road'];self.camera_frames={c:0 for c in common.CAMERAS}
             self.record_start=now;self.until=now+self.cfg['clip_seconds'];self.last_packet=now;self.frames=0
             self.error=''
+            if self.buffer_enabled:
+                for camera,ring in self.rings.items():
+                    for packet in ring.snapshot(int(now*1e9),self.cfg['prebuffer_seconds']):
+                        self.write_packet(packet,camera)
         except Exception as e:
             self.error=str(e)
             for f in self.files.values():f.close()
@@ -99,34 +115,55 @@ class Worker:
             if not f.closed:f.flush();os.fsync(f.fileno());f.close()
         self.files={};self.file=None
         if self.event:
-            self.event.update(duration_s=round(time.monotonic()-self.record_start,2),frames=self.frames,ended_reason=reason)
-            self.store.finalize(self.event,self.cfg['fps'],reason!='complete')
-            self.event=None
+            starts=[t.get('start_mono_ns',0) for t in self.event['cameras'].values() if t.get('start_mono_ns')]
+            start=min(starts)/1e9 if starts else self.record_start
+            self.event.update(duration_s=round(time.monotonic()-start,2),post_trigger_s=round(time.monotonic()-self.record_start,2),frames=self.frames,ended_reason=reason)
+            event=self.event;self.event=None
+            event['protected']=common.read(self.store.path(event['id'],'.json')).get('protected',event['protected'])
+            event['state']='finalizing';self.store.metadata(event)
+            if self.finalizer is None:self.finalizer=ThreadPoolExecutor(max_workers=1)
+            # At most one pending finalizer: never accumulate unbounded work.
+            if self.finalizing is not None and not self.finalizing.done():self.finalizing.result()
+            self.finalizing=self.finalizer.submit(self.store.finalize,event,self.cfg['fps'],reason!='complete')
             self.cooldown=time.monotonic()+self.cfg['cooldown_seconds']
         common.RECORD_LEASE.unlink(missing_ok=True)
     def packet(self,msg,camera='road'):
-        if not self.event or camera not in self.files:
-            return
+        if not self.buffer_enabled and not self.event:return
         service={'road':'livestreamRoadEncodeData','wideRoad':'livestreamWideRoadEncodeData','driver':'livestreamDriverEncodeData'}[camera]
-        data=getattr(msg,service);track=self.event['cameras'][camera]
-        f=self.files[camera];count=self.camera_frames[camera]
-        timestamp=getattr(data.idx,'timestampEof',0)
-        if timestamp and timestamp < self.record_start*1e9:
-            return  # Drain old live packets without treating them as event evidence.
-        if not count and not (data.idx.flags & 8 and data.header):
-            return
+        data=getattr(msg,service);now_ns=time.monotonic_ns()
+        timestamp=getattr(data.idx,'timestampEof',0) or now_ns
+        # Reject stale/backlogged data and future timestamps; no unbounded queue.
+        if not 0<=now_ns-timestamp<1_000_000_000:return
+        packet=Packet(timestamp,bool(data.idx.flags & 8 and data.header),bytes(data.header)+bytes(data.data),data.width,data.height)
+        if self.buffer_enabled:self.rings[camera].append(packet,self.cfg['prebuffer_seconds'])
+        if self.event:self.write_packet(packet,camera)
+    def write_packet(self,packet,camera):
+        if not self.event or camera not in self.files:return
+        track=self.event['cameras'][camera];count=self.camera_frames[camera]
+        if packet.timestamp<=track.get('last_mono_ns',0):return
+        if not count and not packet.key:return
+        if not self.buffer_enabled and packet.timestamp<int(self.record_start*1e9):return
         total=sum(x.tell() for x in self.files.values())
-        if total+len(data.header)+len(data.data)>min(128*1048576,self.cfg['storage_mb']*1048576//2):
+        if total+len(packet.payload)>min(128*1048576,self.cfg['storage_mb']*1048576//2):
             self.finish('clip size limit');return
-        f.write(data.header);f.write(data.data)
+        self.files[camera].write(packet.payload)
         self.camera_frames[camera]+=1;self.frames=sum(self.camera_frames.values());self.last_packet=time.monotonic()
-        track.update(frames=self.camera_frames[camera],last_mono_ns=timestamp)
+        track.update(frames=self.camera_frames[camera],last_mono_ns=packet.timestamp)
         if not count:
-            track.update(width=data.width,height=data.height,start_mono_ns=timestamp)
-            self.store.metadata(self.event)
+            track.update(width=packet.width,height=packet.height,start_mono_ns=packet.timestamp,pre_event_s=round(max(0,(int(self.record_start*1e9)-packet.timestamp)/1e9),3))
+            self.event_metadata()
+    def sensor(self,msg,now_ns):
+        if not self.bump_enabled:return
+        try:
+            event=msg.accelerometer
+            if not msg.valid or event.which()!='acceleration':return
+            if self.bump.update(event.acceleration.v,event.timestamp,now_ns,self.cfg['bump_threshold_g']):
+                self.last_trigger_wall=time.time();self.trigger_camera=None;self.begin('bump')
+        except (ValueError,TypeError,AttributeError):
+            self.bump.reset()
     def status(self):
         now=time.monotonic()
-        common.atomic(common.WORKER_STATUS,dict(mono=now,camera=now-self.last_frame<3,frame_age_s=round(now-self.last_frame,1),recording=bool(self.event),event_id=self.event['id'] if self.event else None,motion_score=round(self.score,4),brightness_change=self.brightness,error=self.error,frames=self.frames,last_manual=self.last_manual,last_snapshot=self.last_snapshot,cameras=self.camera_status,trigger_camera=self.trigger_camera,last_trigger_at=self.last_trigger_wall))
+        common.atomic(common.WORKER_STATUS,dict(mono=now,camera=now-self.last_frame<3,frame_age_s=round(now-self.last_frame,1),recording=bool(self.event),event_id=self.event['id'] if self.event else None,motion_score=round(self.score,4),brightness_change=self.brightness,error=self.error,frames=self.frames,last_manual=self.last_manual,last_snapshot=self.last_snapshot,cameras=self.camera_status,trigger_camera=self.trigger_camera,last_trigger_at=self.last_trigger_wall,bump=self.bump.status(time.monotonic_ns(),self.bump_enabled),buffer=dict(enabled=self.buffer_enabled,seconds={c:round(min(self.cfg['prebuffer_seconds'],r.seconds()),1) for c,r in self.rings.items()},bytes=sum(r.bytes for r in self.rings.values()))))
     def run(self):
         from cereal import messaging
         from msgq.visionipc import VisionIpcClient, VisionStreamType
@@ -138,6 +175,7 @@ class Worker:
         signal.signal(signal.SIGINT,lambda *a:setattr(self,'stopping',True))
         self.store.recover(self.cfg)
         clients={c:VisionIpcClient('camerad',getattr(VisionStreamType,t),True) for c,t in (('road','VISION_STREAM_ROAD'),('wideRoad','VISION_STREAM_WIDE_ROAD'),('driver','VISION_STREAM_DRIVER'))}
+        sensor_sock=messaging.sub_sock('accelerometer',conflate=False,timeout=0)
         socks={c:messaging.sub_sock(service,conflate=False,timeout=0) for c,service in (('road','livestreamRoadEncodeData'),('wideRoad','livestreamWideRoadEncodeData'),('driver','livestreamDriverEncodeData'))}
         try:
             while not self.stopping:
@@ -145,6 +183,16 @@ class Worker:
                 if not d:
                     break
                 self.cfg=d.get('config',self.cfg)
+                self.buffer_enabled=bool(d.get('armed') and self.cfg.get('prebuffer_seconds',0)>0)
+                bump_enabled=bool(d.get('armed') and self.cfg.get('bump_detection',0))
+                if bump_enabled!=self.bump_enabled:self.bump.reset()
+                self.bump_enabled=bump_enabled
+                if not self.buffer_enabled:
+                    for ring in self.rings.values():ring.clear()
+                for _ in range(256):
+                    sensor_msg=messaging.recv_one_or_none(sensor_sock)
+                    if sensor_msg is None:break
+                    self.sensor(sensor_msg,time.monotonic_ns())
                 stop=d.get('stop_seq',0)
                 if stop!=self.last_stop:
                     self.finish('manual stop');self.last_stop=stop
@@ -179,8 +227,7 @@ class Worker:
                     self.last_manual=manual;self.begin('manual')
                 if self.event:
                     common.atomic(common.RECORD_LEASE,{'until':now+3})
-                # Drain even when not recording: never retain encoded pre-event footage
-                # or let a live-view subscription accumulate old packets in memory.
+                # Always drain; retain only bounded compressed RAM rings when armed.
                 for camera,sock in socks.items():
                     for _ in range(32):
                         msg=messaging.recv_one_or_none(sock)
@@ -195,8 +242,9 @@ class Worker:
                     self.last_status=now;self.status()
                 time.sleep(.025 if self.event else .05)
         finally:
-            self.finish('security stopped');self.status()
-            lock.close()
+            self.finish('security stopped')
+            if self.finalizer is not None:self.finalizer.shutdown(wait=True)
+            self.status();lock.close()
 
 def main():
     Worker().run()

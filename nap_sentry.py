@@ -252,9 +252,9 @@ class Sentry:
                 elif op=='config':
                     if self.deadline or self.armed_until or self.transient_until:raise ValueError('Disarm and stop viewing before changing settings')
                     self.cfg=common.validate_config(body,self.cfg);common.atomic(common.CONFIG,self.cfg);self.store.prune(self.cfg)
-                elif op=='cabin_motion':
+                elif op in ('cabin_motion','bump_detection','prebuffer'):
                     if type(body.get('enabled')) is not bool:raise ValueError('Boolean required')
-                    self.cfg=common.validate_config({'cabin_motion':int(body['enabled'])},self.cfg)
+                    self.cfg=common.validate_config({('prebuffer_seconds' if op=='prebuffer' else op):(10 if body['enabled'] else 0) if op=='prebuffer' else int(body['enabled'])},self.cfg)
                     common.atomic(common.CONFIG,self.cfg)
                 elif op=='motion':self.motion=bool(body.get('enabled'))
                 elif op=='ping':
