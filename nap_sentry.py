@@ -181,7 +181,7 @@ class Sentry:
                     self.safe=False;self.reason='Safety telemetry unavailable';self.suspended=True;self.safe_since=None;self.resume_wait=60;self.off()
             time.sleep(.2)
     def media(self,h,ident,kind):
-        suffix='.jpg' if kind=='thumbnail' else '.mp4'
+        suffix='.jpg' if kind=='thumbnail' else common.video_suffix(kind[6:] if kind.startswith('video-') else 'road')
         path=self.store.path(ident,suffix)
         if not path.is_file():return h.send_json({'error':'Evidence unavailable'},404)
         size=path.stat().st_size;start=0;end=size-1;partial=False
@@ -222,7 +222,7 @@ class Sentry:
                 elif op=='events':h.send_json({'events':self.store.events()[:1000],'storage':self.store.usage()})
                 elif op.startswith('media/'):
                     parts=op.split('/')
-                    if len(parts)!=3 or parts[2] not in ('thumbnail','video'):raise ValueError('Invalid evidence path')
+                    if len(parts)!=3 or parts[2] not in ('thumbnail','video','video-road','video-wideRoad','video-driver'):raise ValueError('Invalid evidence path')
                     self.media(h,parts[1],parts[2])
                 else:h.send_json({'error':'Not found'},404)
                 return True

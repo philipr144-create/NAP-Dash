@@ -86,6 +86,18 @@ class MotionTests(unittest.TestCase):
         for _ in range(50):
             b=a.copy();mask=rng.random(a.shape)<.01;b[mask]=200
             self.assertFalse(d.update(b,c.DEFAULTS)[0])
+    def test_small_dark_moving_object(self):
+        d=Detector();a=np.full((90,160),8,dtype=np.uint8)
+        for _ in range(8):d.update(a,c.DEFAULTS)
+        hits=[]
+        for x in (20,24,28,32,36):
+            b=a.copy();b[40:50,x:x+18]=35;hits.append(d.update(b,c.DEFAULTS)[0])
+        self.assertTrue(any(hits))
+    def test_dark_sensor_noise_does_not_trigger(self):
+        d=Detector();rng=np.random.default_rng(15)
+        for _ in range(80):
+            a=np.clip(rng.normal(8,2,(90,160)),0,255).astype(np.uint8)
+            self.assertFalse(d.update(a,c.DEFAULTS)[0])
     def test_small_global_drift(self):
         d,a=self.warmed()
         for k in range(20):self.assertFalse(d.update(a+k,c.DEFAULTS)[0])
@@ -149,13 +161,48 @@ class StorageTests(Base):
         self.assertEqual(worker.until,150)
         with patch('server.sentry_worker.time.monotonic',return_value=219):worker.begin('motion')
         self.assertEqual(worker.until,220)
-        worker.file.close();worker.file=None
+        [f.close() for f in worker.files.values()];worker.files={};worker.file=None
     def test_waits_for_keyframe(self):
         worker=Worker();worker.begin('manual')
         msg=NS(livestreamRoadEncodeData=NS(idx=NS(flags=0),header=b'',data=b'p',width=640,height=360))
         worker.packet(msg);self.assertEqual(worker.frames,0)
         msg.livestreamRoadEncodeData.idx.flags=8;msg.livestreamRoadEncodeData.header=b'header'
-        worker.packet(msg);self.assertEqual(worker.frames,1);worker.file.close();worker.file=None
+        worker.packet(msg);self.assertEqual(worker.frames,1);[f.close() for f in worker.files.values()];worker.files={};worker.file=None
+
+class MultiCameraTests(Base):
+    def test_event_opens_all_tracks_and_waits_for_each_keyframe(self):
+        w=Worker();w.begin('manual')
+        self.assertEqual(set(w.files),set(c.CAMERAS))
+        for camera,service in (('road','livestreamRoadEncodeData'),('wideRoad','livestreamWideRoadEncodeData'),('driver','livestreamDriverEncodeData')):
+            data=NS(idx=NS(flags=0,timestampEof=0),header=b'',data=b'p',width=640,height=360)
+            w.packet(NS(**{service:data}),camera);self.assertEqual(w.camera_frames[camera],0)
+            data.idx.flags=8;data.header=b'h';w.packet(NS(**{service:data}),camera)
+            self.assertEqual(w.camera_frames[camera],1)
+        self.assertEqual(w.frames,3)
+        for f in w.files.values():f.close()
+    def test_group_delete_and_retention_remove_every_camera(self):
+        store=c.Store();e=store.create('motion',None,c.DEFAULTS);e['state']='ready';store.metadata(e)
+        for camera in c.CAMERAS:store.path(e['id'],c.video_suffix(camera)).write_bytes(b'video')
+        store.delete(e['id']);self.assertFalse(list(store.root.glob(e['id']+'*')))
+    def test_partial_finalization_preserves_available_cameras(self):
+        store=c.Store();e=store.create('manual',None,c.DEFAULTS)
+        e['cameras']={camera:{} for camera in c.CAMERAS}
+        for camera in ('road','driver'):store.path(e['id'],c.video_suffix(camera,True)).write_bytes(b'encoded')
+        def remux(args,**kwargs):Path(args[-1]).write_bytes(b'mp4')
+        with patch.object(c.subprocess,'run',side_effect=remux):store.finalize(e,10)
+        self.assertEqual(e['state'],'ready');self.assertFalse(e['complete'])
+        self.assertEqual(e['cameras']['wideRoad']['state'],'failed')
+        self.assertEqual(e['cameras']['driver']['state'],'ready')
+        self.assertEqual(e['bytes'],6)
+    def test_camera_names_cannot_escape_evidence_directory(self):
+        with self.assertRaises(ValueError):c.video_suffix('../../logs')
+    def test_recovery_preserves_already_finalized_track(self):
+        store=c.Store();e=store.create('manual',None,c.DEFAULTS);e['cameras']={'road':{},'driver':{}}
+        store.path(e['id'],'.mp4').write_bytes(b'already ready')
+        store.path(e['id'],'.driver.partial.h264').write_bytes(b'raw')
+        def remux(args,**kwargs):Path(args[-1]).write_bytes(b'mp4')
+        with patch.object(c.subprocess,'run',side_effect=remux):store.finalize(e,10,True)
+        self.assertTrue(e['complete']);self.assertEqual(store.path(e['id'],'.mp4').read_bytes(),b'already ready')
 
 class AutomaticTests(Base):
     def setUp(self):

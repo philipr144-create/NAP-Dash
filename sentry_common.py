@@ -17,8 +17,15 @@ WORKER_STATUS = Path('/dev/shm/nap_sentry_worker.json')
 ROOT = Path('/data/nap_sentry/events')
 CONFIG = Path('/data/nap_sentry/config.json')
 POLICY = Path('/data/nap_sentry/policy.json')
+CAMERAS = ('road','wideRoad','driver')
+
+def video_suffix(camera='road', partial=False):
+    if camera not in CAMERAS:
+        raise ValueError('Invalid camera')
+    return ('' if camera=='road' else '.'+camera) + ('.partial.h264' if partial else '.mp4')
+
 RETENTION_SECONDS = 24 * 60 * 60
-DEFAULTS = dict(auto_arm=1, analysis_fps=2, pixel_threshold=18, changed_fraction=.035, confirmation_frames=3,
+DEFAULTS = dict(auto_arm=1, analysis_fps=2, pixel_threshold=10, changed_fraction=.008, confirmation_frames=2,
                 brightness_jump=25, clip_seconds=30, max_clip_seconds=120, cooldown_seconds=15,
                 storage_mb=512, reserve_mb=1024, warn_c=70, suspend_c=75, armed_minutes=30,
                 width=640, height=360, fps=10, bitrate=500000)
@@ -135,7 +142,9 @@ class Store:
                     self._delete(d['id']);usage=self.usage()
             return usage['used_bytes'] < cfg['storage_mb']*1048576 and usage['free_bytes'] > cfg['reserve_mb']*1048576 and usage['event_count'] < 1000
     def _delete(self, ident):
-        for suffix in ('.json','.jpg','.mp4','.partial.h264','.partial.mp4'):
+        for suffix in ('.json','.jpg','.mp4','.partial.h264','.partial.mp4',
+                       '.wideRoad.mp4','.wideRoad.partial.h264','.wideRoad.partial.mp4',
+                       '.driver.mp4','.driver.partial.h264','.driver.partial.mp4'):
             self.path(ident,suffix).unlink(missing_ok=True)
     def delete(self, ident):
         with self.locked():
@@ -155,21 +164,36 @@ class Store:
         self.metadata(d)
         return d
     def finalize(self,d,fps,interrupted=False):
-        raw=self.path(d['id'],'.partial.h264');part=self.path(d['id'],'.partial.mp4')
         d.update(state='finalizing',interrupted=interrupted)
         self.metadata(d)
-        try:
-            if not raw.exists() or raw.stat().st_size == 0:
-                raise ValueError('No encoded frames received')
-            ffmpeg='/data/server/ffmpeg_full'
-            subprocess.run([ffmpeg,'-v','error','-nostdin','-y','-fflags','+genpts','-r',str(fps),'-i',str(raw),'-c:v','copy','-movflags','+faststart',str(part)],check=True,timeout=3,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            part.replace(self.path(d['id'],'.mp4'))
-            d.update(state='ready',bytes=self.path(d['id'],'.mp4').stat().st_size)
-        except Exception as e:
-            d.update(state='failed',error=str(e)[:160])
-        finally:
-            raw.unlink(missing_ok=True);part.unlink(missing_ok=True)
-            self.metadata(d)
+        tracks=d.get('cameras') or {'road':{}}
+        total=0;ready=0
+        for camera,track in tracks.items():
+            raw=self.path(d['id'],video_suffix(camera,True))
+            part=self.path(d['id'],('' if camera=='road' else '.'+camera)+'.partial.mp4')
+            target=self.path(d['id'],video_suffix(camera))
+            try:
+                # A recovery may resume after one track was already finalized.
+                if target.exists() and not raw.exists():
+                    track.update(state='ready',bytes=target.stat().st_size)
+                else:
+                    if not raw.exists() or raw.stat().st_size==0:
+                        raise ValueError('No encoded frames received')
+                    subprocess.run(['/data/server/ffmpeg_full','-v','error','-nostdin','-y','-fflags','+genpts','-r',str(fps),'-i',str(raw),'-c:v','copy','-movflags','+faststart',str(part)],check=True,timeout=3,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    part.replace(target)
+                    track.update(state='ready',bytes=target.stat().st_size)
+                ready+=1;total+=track['bytes']
+            except Exception as e:
+                track.update(state='failed',error=str(e)[:160])
+            finally:
+                raw.unlink(missing_ok=True);part.unlink(missing_ok=True)
+        starts=[t['start_mono_ns'] for t in tracks.values() if t.get('start_mono_ns')]
+        if starts:
+            origin=min(starts)
+            for t in tracks.values():t['offset_s']=round((t.get('start_mono_ns',origin)-origin)/1e9,4)
+        d.update(cameras=tracks,state='ready' if ready else 'failed',bytes=total,complete=ready==len(tracks))
+        if ready<len(tracks):d['error']='One or more cameras unavailable; available views preserved'
+        self.metadata(d)
     def recover(self, cfg):
         for d in self.events():
             if d.get('state') in ('recording','finalizing'):
