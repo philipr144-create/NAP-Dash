@@ -204,6 +204,38 @@ class MultiCameraTests(Base):
         with patch.object(c.subprocess,'run',side_effect=remux):store.finalize(e,10,True)
         self.assertTrue(e['complete']);self.assertEqual(store.path(e['id'],'.mp4').read_bytes(),b'already ready')
 
+class CabinMotionTests(Base):
+    def test_default_off_and_bounded_setting(self):
+        self.assertEqual(c.config()['cabin_motion'],0)
+        self.assertEqual(c.validate_config({'cabin_motion':1})['cabin_motion'],1)
+        for value in (2,-1,True):
+            with self.assertRaises(ValueError):c.validate_config({'cabin_motion':value})
+    def test_toggle_persists_while_armed_without_changing_session(self):
+        obj=n.Sentry();obj.armed_until=500;obj.deadline=450
+        for enabled in (True,False):
+            h=Handler('cabin_motion',body={'enabled':enabled});obj.handle(h)
+            self.assertEqual(h.result[0],200)
+            self.assertEqual(obj.armed_until,500);self.assertEqual(obj.deadline,450)
+            self.assertEqual(n.Sentry().cfg['cabin_motion'],int(enabled))
+        h=Handler('cabin_motion',body={'enabled':'false'});obj.handle(h)
+        self.assertEqual(h.result[0],409)
+    def test_cabin_gate_resets_history_and_front_stays_enabled(self):
+        w=Worker();gray=np.zeros((90,160),dtype=np.uint8)
+        for camera in c.CAMERAS:
+            with patch.object(w.detectors[camera],'update',return_value=(True,.5,False)) as update:
+                hit,_,_=w.analyze(camera,gray,True)
+                self.assertEqual(hit,camera!='driver')
+                self.assertEqual(update.call_count,int(camera!='driver'))
+        w.cfg['cabin_motion']=1
+        with patch.object(w.detectors['driver'],'update',return_value=(True,.5,False)):
+            self.assertTrue(w.analyze('driver',gray,True)[0])
+            self.assertFalse(w.analyze('driver',gray,False)[0])
+        self.assertEqual(w.detectors['driver'].warmup,5)
+    def test_cabin_off_still_records_all_three(self):
+        w=Worker();self.assertEqual(w.cfg['cabin_motion'],0)
+        w.begin('motion');self.assertEqual(set(w.files),set(c.CAMERAS))
+        for f in w.files.values():f.close()
+
 class AutomaticTests(Base):
     def setUp(self):
         super().setUp();self.obj=n.Sentry();self.obj.safe=True;self.obj.cooldown=0

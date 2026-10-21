@@ -66,6 +66,13 @@ class Worker:
         self.cooldown=0;self.last_frame=0;self.last_packet=0;self.last_sample=0;self.last_status=0
         self.score=0.;self.brightness=False;self.thumbnail=None;self.last_snapshot='';self.last_manual='';self.last_stop=0
         self.gray=None;self.error='';self.frames=0;self.stopping=False;self.last_space=0;self.space_ok=True
+    def analyze(self,camera,gray,enabled):
+        # Disabling a trigger source leaves its recording/live track untouched.
+        # Reset history so re-enabling it starts with a fresh warmup.
+        if not enabled or (camera=='driver' and not self.cfg.get('cabin_motion',0)):
+            self.detectors[camera]=Detector()
+            return False,0.,False
+        return self.detectors[camera].update(gray,self.cfg)
     def begin(self,kind):
         now=time.monotonic()
         if self.event:
@@ -154,12 +161,9 @@ class Worker:
                         gray=frame_gray(buf)
                         if camera=='road':
                             self.last_frame=now;self.gray=gray
-                        hit=False;score=0.;brightness=False
-                        if d.get('armed') and d.get('motion'):
-                            hit,score,brightness=self.detectors[camera].update(gray,self.cfg)
-                        else:self.detectors[camera]=Detector()
+                        hit,score,brightness=self.analyze(camera,gray,d.get('armed') and d.get('motion'))
                         prior=self.camera_status.get(camera,{})
-                        self.camera_status[camera]=dict(available=True,mono=now,score=round(score,4),peak=max(score,prior.get('peak',0)),luma=round(float(gray.mean()),1),brightness_change=brightness,confirmations=self.detectors[camera].consecutive)
+                        self.camera_status[camera]=dict(available=True,detection_enabled=bool(d.get('armed') and d.get('motion') and (camera!='driver' or self.cfg.get('cabin_motion',0))),mono=now,score=round(score,4),peak=max(score,prior.get('peak',0)),luma=round(float(gray.mean()),1),brightness_change=brightness,confirmations=self.detectors[camera].consecutive)
                         if hit:
                             self.last_motion=now;self.last_trigger_wall=time.time();self.trigger_camera=camera;self.begin('motion')
                     self.score=max((v.get('score',0) for v in self.camera_status.values()),default=0)

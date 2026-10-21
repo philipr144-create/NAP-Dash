@@ -75,7 +75,7 @@ cd /data/server
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s tests -p 'test_sentry*.py'
 ```
 
-Thirty-nine regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
+Forty-three regression tests cover motion/brightness/noise, power/thermal/freshness gates, malformed and separate resource leases, authentication including evidence, bounded/non-extending deadlines, recording tail extension, keyframe start, quota retention/protection, free-space rejection, path validation, interrupted recordings, and browser PIN remembering.
 
 Actual comma bench checks also passed: low-rate camera sampling without encoder; real user hand movement triggered a finalized front-camera clip (313 decoded frames, 640×360/10 fps, about 2 MB); real snapshot; manual clip; simultaneous physical three-camera WebRTC frames; heartbeat/disconnect cleanup preserving arming; browser event playback; private thumbnails/video and range requests; protect/unprotect/delete; decodable interrupted H264 recovery; and disarm resource release.
 
@@ -93,8 +93,12 @@ To roll back this update to manual/timed V2, restore `nap_sentry.py`, `sentry_co
 
 ## Grouped camera events
 
-Motion analysis samples front, wide front, and cabin independently. A trigger from any view starts the same bounded event on all three hardware H264 streams. Default sensitivity is 10 luma levels, 0.8% spatially supported change, and two confirmations, with a short background comparison for small/dark moving objects. Uniform exposure jumps and isolated sensor noise remain suppressed; passing headlights without a visible object are not guaranteed triggers. Darkness and distance still limit detection.
+Motion analysis samples front and wide front independently, plus cabin when its optional toggle is enabled. A trigger from an enabled view starts the same bounded event on all three hardware H264 streams. Default sensitivity is 10 luma levels, 0.8% spatially supported change, and two confirmations, with a short background comparison for small/dark moving objects. Uniform exposure jumps and isolated sensor noise remain suppressed; passing headlights without a visible object are not guaranteed triggers. Darkness and distance still limit detection.
 
 Each event includes per-camera keyframe timestamps, frame counts, offsets, and availability. Dash presents three labeled views with one Play/Pause and seek timeline; offsets use camera capture timestamps. Missing/failed cameras are labeled and do not discard usable evidence. Old front-only clips remain playable. Thumbnails and snapshots remain front-only. There is no continuous recording or pre-event footage.
 
 The motion activity tile reports each camera score; its tooltip includes the threshold and last detection. Temperature, ignition, voltage, quotas, and 24-hour retention apply to the grouped event. Three video tracks consume more event storage than the previous front-only clips.
+
+## Cabin motion toggle
+
+**Cabin motion detection** defaults off and is saved in configuration (`cabin_motion: 0` or `1`). It can be changed while monitoring or viewing, without disarming. Front/wide-front triggers and manual events continue to record all three cameras with either setting. Switching the toggle off resets cabin detection history; switching it on starts a fresh warmup. Global Motion detection still controls every motion trigger. Existing recordings are unaffected.
