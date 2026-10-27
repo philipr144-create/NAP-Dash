@@ -3,8 +3,6 @@ import csv, io, json, threading, time, os, subprocess, glob, traceback, uuid, sq
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
-from server.airride import request as airride_request
-from server.airride_page import AIRRIDE_HTML
 from server.nap_sentry import Sentry
 
 SENTRY = None
@@ -1270,6 +1268,8 @@ def telemetry():
                     removed = True
             if not removed: return
 
+    body_cache = {}
+    body_receiver = BodyCanReceiver(messaging)
     tick = 0
     stats_file = "/data/nap_miles.json"
     engage_counts = {"manual": 0.0, "lat": 0.0, "long": 0.0, "both": 0.0}
@@ -1284,6 +1284,9 @@ def telemetry():
     while not STOP.is_set():
         try:
             sm.update(100)
+            body_receiver.drain(body_cache)
+            with LOCK:
+                STATE['_assistant_body'] = body_snapshot(body_cache)
             publish_vehicle_snapshot(sm)
             
             now = time.monotonic()
@@ -1413,6 +1416,11 @@ def telemetry():
                     storage_total = storage_free = storage_used = 0
                     storage_pct = 0.0
                     
+                STATE['_assistant_sources'] = {
+                    'radar_received': sm.recv_time.get('radarState', 0),
+                    'radar_valid': sm.valid.get('radarState', False),
+                    'radar_alive': sm.alive.get('radarState', False),
+                }
                 STATE.update({
                     "ts": time.time(),
                     "health": {"temp": max(safe_attr(ds, 'cpuTempC', [0])), "battery": num(safe_attr(ds, "batteryPercent", 0)), "uptime": uptime,
@@ -2790,7 +2798,7 @@ body{background:radial-gradient(circle at 38% 0%,#142e36 0,#09141a 42%,#070b0f 1
 </style></head><body><div class="shell">
 <header class="top"><div><div class="eyebrow">Not Auto Pilot</div><div class="brand">NAP <span>Telemetry</span></div></div><div class="connection"><span>LOW-BANDWIDTH CONSOLE · </span><b id="top-status">CONNECTING</b><div id="top-age">Waiting for comma</div></div></header>
 <nav class="tabs" aria-label="Dashboard sections">
- <button class="active" data-tab="overview">Home</button><a href="/sentry">Sentry</a><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="phone">Phone</button><a href="/airride">Air Ride</a>
+ <button class="active" data-tab="overview">Home</button><a href="/sentry">Sentry</a><button data-tab="battery">Battery</button><button data-tab="energy">Energy</button><button data-tab="performance">Performance</button><button data-tab="history">History</button><button data-tab="cameras">Cameras</button><button data-tab="phone">Phone</button><a href="/assistant">Assistant</a>
 </nav>
 
 <main>
@@ -2982,6 +2990,12 @@ from server.phone_navigation.phone_nav import PhoneNavigation
 PHONE_NAV = PhoneNavigation(update=update_navigation, clear=clear_navigation)
 
 
+# NAP_READ_ONLY_ASSISTANT_V1
+from server.nap_body_telemetry import BodyCanReceiver, snapshot as body_snapshot
+from server.nap_assistant_controls import handle as handle_assistant_controls
+from server.nap_assistant import handle as handle_assistant
+from server.nap_gemini import handle as handle_gemini
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def send_json(self, o, status=200):
@@ -3008,6 +3022,7 @@ class Handler(BaseHTTPRequestHandler):
         if SENTRY is not None and SENTRY.handle(self): return
         if PHONE_NAV.handle(self): return
         p = urlparse(self.path).path
+        if handle_assistant(self, p, STATE, LOCK): return
         if p in ("/", "/index.html"):
             b = DASHBOARD_HTML.encode()
             self.send_response(200)
@@ -3016,10 +3031,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
-        elif p in ("/airride", "/airride/"):
-            self.send_bytes(AIRRIDE_HTML.encode(), "text/html; charset=utf-8")
-        elif p == "/api/airride/status":
-            self.send_json(airride_request({"action": "status"}))
         elif p in ("/phone", "/phone/"):
             b = PHONE_HTML.encode()
             self.send_response(200)
@@ -3190,6 +3201,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             except Exception: pass
 
     def do_POST(self):
+        if handle_assistant_controls(self, PHONE_NAV.token, pm, PM_LOCK): return
+        if handle_gemini(self, PHONE_NAV.token): return
         if SENTRY is not None and SENTRY.handle(self): return
         if PHONE_NAV.handle(self): return
         p = urlparse(self.path).path
@@ -3197,16 +3210,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             n = int(self.headers.get("Content-Length", "0"))
             if n < 0 or n > NAV_MAX_BODY: return self.send_json({"error": "payload too large"}, 413)
             d = json.loads(self.rfile.read(n).decode())
-            if p == "/api/airride":
-                # Require same-origin JSON: prevent cross-site form commands.
-                origin = self.headers.get("Origin")
-                if origin and urlparse(origin).netloc != self.headers.get("Host"):
-                    return self.send_json({"error": "same origin required"}, 403)
-                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-                    return self.send_json({"error": "JSON required"}, 415)
-                if not isinstance(d, dict): return self.send_json({"error": "JSON object required"}, 400)
-                result = airride_request(d)
-                return self.send_json(result, 409 if "error" in result else 200)
             if p == "/api/nav/update":
                 nav = update_navigation(d)
                 return self.send_json({"ok": True, "navigation": nav})

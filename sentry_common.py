@@ -155,6 +155,18 @@ class Store:
             if d.get('state') in ('recording','finalizing'):
                 raise ValueError('Stop recording before deleting')
             self._delete(ident)
+    def set_protected(self, ident, protected):
+        if type(protected) is not bool:
+            raise ValueError('Boolean required for keep option')
+        with self.locked():
+            d=read(self.path(ident,'.json'))
+            if not d or d.get('id')!=ident:
+                raise ValueError('Event not found')
+            if d.get('state') in ('recording','finalizing'):
+                raise ValueError('Wait for recording to finish before keeping it')
+            d['protected']=protected
+            self.metadata(d)
+        return d
     def metadata(self,d):
         atomic(self.path(d['id'],'.json'),d)
     def create(self, kind, thumbnail, cfg):

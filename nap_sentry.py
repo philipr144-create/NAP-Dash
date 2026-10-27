@@ -246,9 +246,7 @@ class Sentry:
                 elif op=='record_stop':self.stop_seq+=1;self.record_id='';self.transient_until=min(self.transient_until,now+3)
                 elif op=='delete':self.store.delete(body.get('id'))
                 elif op=='protect':
-                    d=common.read(self.store.path(body.get('id'),'.json'))
-                    if not d:raise ValueError('Event not found')
-                    d['protected']=bool(body.get('protected'));self.store.metadata(d)
+                    self.store.set_protected(body.get('id'),body.get('protected'))
                 elif op=='config':
                     if self.deadline or self.armed_until or self.transient_until:raise ValueError('Disarm and stop viewing before changing settings')
                     self.cfg=common.validate_config(body,self.cfg);common.atomic(common.CONFIG,self.cfg);self.store.prune(self.cfg)
