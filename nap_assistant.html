@@ -255,7 +255,7 @@ async function liveMessage(event,serial){
   if(calls.length>6||live.toolCount>12)throw Error('Live tool-call limit reached.');
   const cache=new Map(),responses=[];
   for(const call of calls){
-   try{responses.push({id:call.id,name:call.name,response:await dispatchTool(call.name,call.args||{},cache)});}catch(e){responses.push({id:call.id,name:call.name,response:{success:false,error:e.message||'Tool unavailable.'}});} 
+   try{responses.push({id:call.id,name:call.name,response:await dispatchTool(call.name,call.args||{},cache)});}catch(e){responses.push({id:call.id,name:call.name,response:{success:false,error:e.message||'Tool unavailable.'}});}
   }
   if(serial===live.serial)liveSend({toolResponse:{functionResponses:responses}});
  }
