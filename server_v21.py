@@ -4,6 +4,9 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from server.nap_sentry import Sentry
+from server.nap_control_diagnostics import ControlDiagnostics
+from server.nap_bms_hires import BMS_HIRES  # NAP_BMS_HIRES_V1
+from server.nap_recorded_diagnostics import replay as replay_recorded, REPLAY_LOCK
 
 SENTRY = None
 import cereal.messaging as messaging
@@ -147,7 +150,7 @@ class HistoryDatabase:
     """Bounded SQLite history with non-blocking telemetry writes and diagnostics."""
     LIMITS = {
         "performance": 5000, "regen": 10000, "battery": 150000,
-        "efficiency": 10000, "charging": 5000, "settings": 5000,
+        "efficiency": 10000, "charging": 5000, "settings": 5000, "control_diagnostic": 250,
     }
     LEGACY = {
         "performance": "performance_runs.jsonl",
@@ -1252,7 +1255,7 @@ def telemetry():
     init_globals()
     svcs = [
         "carState", "selfdriveState", "controlsState",
-        "radarState", "deviceState", "carControl", "longitudinalPlan", "can"
+        "radarState", "deviceState", "carControl", "longitudinalPlan", "pandaStates", "onroadEvents"
     ]
     sm = None
     while svcs:
@@ -1280,10 +1283,19 @@ def telemetry():
     except: pass
 
     last_time = time.monotonic()
+    control_diag = ControlDiagnostics(HISTORY_DB)
+    can_sock = messaging.sub_sock('can', conflate=False)  # NAP_BMS_NONCONFLATED_V1
 
     while not STOP.is_set():
         try:
             sm.update(100)
+            can_frames = []
+            for can_batch in messaging.drain_sock(can_sock):
+                if can_batch.which() == 'can':
+                    can_frames.extend(
+                        (can_batch.logMonoTime, frame)
+                        for frame in can_batch.can
+                    )
             body_receiver.drain(body_cache)
             with LOCK:
                 STATE['_assistant_body'] = body_snapshot(body_cache)
@@ -1307,6 +1319,7 @@ def telemetry():
                 current_settings = read_params()
                 with LOCK:
                     STATE["settings"] = current_settings
+                    STATE["_assistant_settings_mono"] = time.monotonic()
             if tick % 100 == 0:
                 try:
                     with open(stats_file, "w") as f: json.dump(engage_counts, f)
@@ -1417,7 +1430,8 @@ def telemetry():
                     storage_pct = 0.0
                     
                 STATE['_assistant_sources'] = {
-                    'radar_received': sm.recv_time.get('radarState', 0),
+                    'radar_received': sm.logMonoTime.get('radarState', 0) / 1e9,
+                    'feeds': {s: {'mono': sm.logMonoTime.get(s, 0) / 1e9, 'valid': bool(sm.valid.get(s, False)), 'alive': bool(sm.alive.get(s, False))} for s in ('carState', 'selfdriveState', 'deviceState', 'carControl', 'longitudinalPlan')},
                     'radar_valid': sm.valid.get('radarState', False),
                     'radar_alive': sm.alive.get('radarState', False),
                 }
@@ -1447,25 +1461,33 @@ def telemetry():
                     }
                 })
                 
-                if "can" in svcs and sm.updated.get("can", False):
+                if can_frames:
                     try:
                         STATE["bms"].setdefault("temps_dict", {})
-                        for msg in sm["can"]:
+                        for can_batch_ns, msg in can_frames:
+                            # Telemetry only: reject reflected TX and delayed CAN batches.
+                            if msg.src not in (0, 1, 2) or not 0 <= time.monotonic() - can_batch_ns / 1e9 <= .5:
+                                continue
                             addr = msg.address
                             d = msg.dat
+                            BMS_HIRES.observe_frame(addr, d, msg.src, can_batch_ns / 1e9, v_ego)
                             
                             if (addr == 0x132 or addr == 0x102) and len(d) >= 4:
                                 STATE["bms"]["pack_v"] = (d[0] | (d[1] << 8)) * 0.01
                                 raw_i = d[2] | (d[3] << 8)
                                 if raw_i >= 32768: raw_i -= 65536
                                 STATE["bms"]["pack_i"] = raw_i * 0.1
+                                mark_battery(STATE, ("pack_v", "pack_i"), can_batch_ns / 1e9, addr, msg.src)
                                 
                             elif addr == 0x302 and len(d) >= 3:
                                 STATE["bms"]["ui_soc"] = ((d[1] >> 2) | ((d[2] & 0x0F) << 6)) * 0.1
+                                mark_battery(STATE, ("ui_soc",), can_batch_ns / 1e9, addr, msg.src)
                                 
                             elif addr == 0x338 and len(d) >= 2:
                                 val = d[0] | (d[1] << 8)
-                                if val < 1000: STATE["bms"]["rated_range"] = val
+                                if val < 1000:
+                                    STATE["bms"]["rated_range"] = val
+                                    mark_battery(STATE, ("rated_range",), can_batch_ns / 1e9, addr, msg.src)
                                 
                             elif addr == 0x6F2 and len(d) >= 8:
                                 mux = d[0]
@@ -1477,6 +1499,7 @@ def telemetry():
                                         for k, raw in enumerate(vals):
                                             if raw in (0, 0x3FFF): continue
                                             STATE["bms"]["bricks"][idx + k] = raw * 0.305175
+                                            mark_battery(STATE, ("brick_" + str(idx + k),), can_batch_ns / 1e9, addr, msg.src)
                                     else:
                                         base = (mux - 24) * 4
                                         for k, raw in enumerate(vals):
@@ -1485,6 +1508,7 @@ def telemetry():
                                             t = raw * 0.0122
                                             if -50 < t < 120:
                                                 STATE["bms"]["temps_dict"][f"{base+k}"] = t
+                                                mark_battery(STATE, ("temp_" + str(base+k),), can_batch_ns / 1e9, addr, msg.src)
                                                 
                             elif addr == 0x382 and len(d) >= 8:
                                 # Current legacy Model S firmware layout:
@@ -1550,6 +1574,7 @@ def telemetry():
                                         else 0.0
                                     )
 
+                                    mark_battery(STATE, ("nom_full", "nom_rem", "expected_rem", "ideal_rem", "charge_complete", "buffer", "usable_full", "usable_rem", "display_soc"), can_batch_ns / 1e9, addr, msg.src)
                                     STATE["bms"]["nom_full"] = nom_full
                                     STATE["bms"]["nom_rem"] = nom_rem
                                     STATE["bms"]["expected_rem"] = expected_rem
@@ -1566,6 +1591,7 @@ def telemetry():
                             elif addr == 0x252 and len(d) >= 4:
                                 STATE["bms"]["max_regen"] = (d[0] | (d[1] << 8)) * 0.01
                                 STATE["bms"]["max_discharge"] = (d[2] | (d[3] << 8)) * 0.01
+                                mark_battery(STATE, ("max_regen", "max_discharge"), can_batch_ns / 1e9, addr, msg.src)
                                 
                     except Exception: pass
 
@@ -1582,7 +1608,15 @@ def telemetry():
                 recorder_sample = {"car": dict(STATE["car"]), "bms": json.loads(json.dumps(STATE["bms"]))}
 
             if recorder_sample is not None:
+                BMS_HIRES.tick(time.monotonic(), HISTORY_DB, STATE)
                 RECORDER.sample(now, recorder_sample)
+            try:
+                control_diag.observe(sm, now)
+                if tick % 20 == 0:
+                    with LOCK:
+                        STATE["control_diagnostics"] = control_diag.status()
+            except Exception as diag_error:
+                control_diag.last_error = str(diag_error)[:160]
             tick += 1
         except Exception: pass
         time.sleep(.05)
@@ -2993,7 +3027,10 @@ PHONE_NAV = PhoneNavigation(update=update_navigation, clear=clear_navigation)
 # NAP_READ_ONLY_ASSISTANT_V1
 from server.nap_body_telemetry import BodyCanReceiver, snapshot as body_snapshot
 from server.nap_assistant_controls import handle as handle_assistant_controls
+from server.nap_assistant_navigation import AssistantNavigation
+ASSISTANT_NAVIGATION = AssistantNavigation(PHONE_NAV)
 from server.nap_assistant import handle as handle_assistant
+from server.nap_assistant_data import mark_battery
 from server.nap_gemini import handle as handle_gemini
 
 class Handler(BaseHTTPRequestHandler):
@@ -3023,6 +3060,26 @@ class Handler(BaseHTTPRequestHandler):
         if PHONE_NAV.handle(self): return
         p = urlparse(self.path).path
         if handle_assistant(self, p, STATE, LOCK): return
+        if p == "/api/control/replay":
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                return self.send_json({"error":"localhost_only"},403)
+            if not Params().get_bool("IsOffroad"):
+                return self.send_json({"error":"offroad_required"},409)
+            if not REPLAY_LOCK.acquire(blocking=False):
+                return self.send_json({"error":"replay_busy"},429)
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                segment = q.get("segment", [""])[0]
+                source = q.get("source", ["qlog"])[0]
+                return self.send_json(replay_recorded(segment, source))
+            except FileNotFoundError as e:
+                return self.send_json({"error":str(e)},404)
+            except ValueError as e:
+                return self.send_json({"error":str(e)},400)
+            except Exception as e:
+                return self.send_json({"error":str(e)[:160]},500)
+            finally:
+                REPLAY_LOCK.release()
         if p in ("/", "/index.html"):
             b = DASHBOARD_HTML.encode()
             self.send_response(200)
@@ -3201,6 +3258,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             except Exception: pass
 
     def do_POST(self):
+        if ASSISTANT_NAVIGATION.handle(self): return
         if handle_assistant_controls(self, PHONE_NAV.token, pm, PM_LOCK): return
         if handle_gemini(self, PHONE_NAV.token): return
         if SENTRY is not None and SENTRY.handle(self): return

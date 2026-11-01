@@ -15,6 +15,9 @@ from . import pairing, turn_settings
 
 ROOT = Path(__file__).resolve().parent
 PRESETS_PATH = Path('/data/nap_destination_presets.json')
+PROVIDER_CACHE_MAX_BYTES = 4_000_000
+PROVIDER_CACHE_MAX_ENTRIES = 8
+PROVIDER_CACHE_TTL = 300
 
 
 def read_presets():
@@ -63,8 +66,13 @@ class PhoneNavigation:
     def provider(self, url):
         with self.provider_lock:
             now = time.monotonic()
-            if url in self.cache and now-self.cache[url][0] < 300:
-                return self.cache[url][1]
+            # Retain bounded wire bytes, not expanded Python route trees.
+            # Expired entries must be removed even when a different URL is used.
+            for key, (saved, _) in list(self.cache.items()):
+                if not 0 <= now-saved < PROVIDER_CACHE_TTL:
+                    del self.cache[key]
+            if url in self.cache:
+                return json.loads(self.cache[url][1])
             pause = 1.1-(now-self.last_request)
             if pause > 0:
                 time.sleep(pause)
@@ -78,9 +86,13 @@ class PhoneNavigation:
             if len(raw) > 4_000_000:
                 raise ValueError('Route too large; choose a closer destination')
             result = json.loads(raw)
-            if len(self.cache) >= 32:
+            while self.cache and (
+                    len(self.cache) >= PROVIDER_CACHE_MAX_ENTRIES
+                    or sum(len(entry[1]) for entry in self.cache.values()) + len(raw)
+                    > PROVIDER_CACHE_MAX_BYTES):
                 self.cache.pop(next(iter(self.cache)))
-            self.cache[url] = (time.monotonic(), result)
+            if len(raw) <= PROVIDER_CACHE_MAX_BYTES:
+                self.cache[url] = (time.monotonic(), raw)
             return result
 
     def route_request(self, origin, destination):

@@ -4,6 +4,7 @@ import math
 import time
 from pathlib import Path
 from server.nap_body_telemetry import body_view
+from server.nap_assistant_data import telemetry_view, freshness
 
 
 def snapshot(state, now=None):
@@ -23,6 +24,7 @@ def snapshot(state, now=None):
         return result
     result['lead'] = {'available': True, 'distance_m': round(distance, 1),
                       'distance_ft': round(distance * 3.28084, 1), 'age_seconds': round(age, 2),
+                      'freshness': freshness(received, 2),
                       'description': 'Estimated longitudinal distance to the detected lead vehicle; not a safety guarantee'}
     return result
 
@@ -31,10 +33,19 @@ def handle(handler, path, state, lock):
     if path in ('/assistant', '/assistant/'):
         handler.send_bytes(Path(__file__).with_name('nap_assistant.html').read_bytes(), 'text/html; charset=utf-8')
         return True
+    if path == '/api/assistant/telemetry':
+        with lock:
+            value = telemetry_view(state)
+        handler.send_json(value)
+        return True
     if path == '/api/assistant/body':
         with lock:
             value = dict(state.get('_assistant_body', {}))
         value = body_view(value)
+        for message in value.get("messages", {}).values():
+            age = message.get("age_seconds")
+            message["observed_at_unix_s"] = time.time() - age if isinstance(age, (int, float)) else None
+            message["status"] = "fresh" if message.get("available") else "stale"
         handler.send_json(value)
         return True
     if path == '/api/assistant/grade':
@@ -42,7 +53,7 @@ def handle(handler, path, state, lock):
             data = json.loads(Path('/dev/shm/nap_predictive_grade_status.json').read_text())
             age = time.monotonic() - data['time']
             keys = ('controller_version', 'preview_trigger_deg', 'confirmation_seconds', 'assist_enabled', 'reason', 'blocks', 'pitch_rise_deg', 'climb_active', 'proposed_add', 'applied_add', 'speed_mps', 'target_mps')
-            value = {'read_only': True, 'available': 0 <= age <= 3, 'age_seconds': round(age, 2)}
+            value = {'read_only': True, 'available': 0 <= age <= 3, 'age_seconds': round(age, 2), 'freshness': freshness(data['time'], 3)}
             if value['available']:
                 value['diagnostics'] = {k: data[k] for k in keys if k in data}
         except (OSError, ValueError, KeyError, TypeError):
