@@ -6,6 +6,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 from server.airride import request as airride_request
 from server.airride_page import AIRRIDE_HTML
 from server.nap_sentry import Sentry
+from server.nap_control_diagnostics import ControlDiagnostics, replay_segment
 
 SENTRY = None
 import cereal.messaging as messaging
@@ -150,6 +151,7 @@ class HistoryDatabase:
     LIMITS = {
         "performance": 5000, "regen": 10000, "battery": 150000,
         "efficiency": 10000, "charging": 5000, "settings": 5000,
+        "control_diagnostic": 250,
     }
     LEGACY = {
         "performance": "performance_runs.jsonl",
@@ -1253,7 +1255,7 @@ def telemetry():
     from server.phone_navigation.vehicle_snapshot import publish as publish_vehicle_snapshot
     init_globals()
     svcs = [
-        "carState", "selfdriveState", "controlsState",
+        "carState", "selfdriveState", "controlsState", "pandaStates", "onroadEvents",
         "radarState", "deviceState", "carControl", "longitudinalPlan", "can"
     ]
     sm = None
@@ -1280,6 +1282,7 @@ def telemetry():
     except: pass
 
     last_time = time.monotonic()
+    control_diag = ControlDiagnostics(HISTORY_DB.append)
 
     while not STOP.is_set():
         try:
@@ -1575,6 +1578,22 @@ def telemetry():
 
             if recorder_sample is not None:
                 RECORDER.sample(now, recorder_sample)
+            try:
+                diag_updated = [s for s in ("carState", "selfdriveState", "carControl", "pandaStates", "onroadEvents")
+                                if s in svcs and sm.updated.get(s, False) and sm.valid.get(s, False)]
+                control_diag.observe(
+                    now, time.time(),
+                    car=cs if fresh("carState") else None,
+                    selfdrive=sd if fresh("selfdriveState") else None,
+                    control=car_control if control_fresh else None,
+                    panda=sm["pandaStates"] if "pandaStates" in svcs and fresh("pandaStates") else None,
+                    onroad=sm["onroadEvents"] if "onroadEvents" in svcs and fresh("onroadEvents") else None,
+                    updated=diag_updated)
+                if tick % 20 == 0:
+                    with LOCK:
+                        STATE["control_diagnostics"] = control_diag.status()
+            except Exception:
+                pass
             tick += 1
         except Exception: pass
         time.sleep(.05)
@@ -3036,6 +3055,29 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/battery/health":
             days = safe_int(parse_qs(urlparse(self.path).query).get("days", [30])[0], 30)
             self.send_json(battery_health_report(days))
+        elif p == "/api/control/diagnostics":
+            q = parse_qs(urlparse(self.path).query)
+            limit = max(1, min(25, safe_int(q.get("limit", ["5"])[0], 5)))
+            with LOCK:
+                status = dict(STATE.get("control_diagnostics") or {})
+            self.send_json({"status": status,
+                            "events": HISTORY_DB.read("control_diagnostic", limit)})
+        elif p.startswith("/api/control/replay/"):
+            if not Params().get_bool("IsOffroad"):
+                return self.send_json({"error": "offroad_required"}, 409)
+            segment = unquote(p.split("/api/control/replay/", 1)[1])
+            if not segment or len(segment) > 96 or "/" in segment or chr(92) in segment or ".." in segment:
+                return self.send_json({"error": "invalid segment"}, 400)
+            seg_dir = os.path.join("/data/media/0/realdata", segment)
+            if not os.path.isdir(seg_dir):
+                return self.send_json({"error": "segment not found"}, 404)
+            log_path = find_log_path(seg_dir)
+            if not log_path:
+                return self.send_json({"error": "qlog/rlog missing"}, 404)
+            try:
+                self.send_json(replay_segment(log_path, segment))
+            except Exception as exc:
+                self.send_json({"error": str(exc)[:200]}, 500)
         elif p == "/api/history/status":
             self.send_json({"database": HISTORY_DB.stats(), "recorder": RECORDER.diagnostics()})
         elif p == "/api/history/summary":
