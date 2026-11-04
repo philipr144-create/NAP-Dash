@@ -1,5 +1,6 @@
 """Optional road-only OSM stop hints. No vehicle control or route instruction."""
 import json
+from .offline_stop_data import local_elements
 import math
 import os
 import tempfile
@@ -34,6 +35,9 @@ def experimental_enabled(path=Path('/data/params/d/ExperimentalMode')):
 
 
 def fetch_roads(point, opener=urlopen):
+    elements = local_elements(point, RADIUS_M)
+    if elements is not None:
+        return elements, 0
     lat, lon = point[1], point[0]
     query = (f'[out:json][timeout:15];way(around:{RADIUS_M},{lat:.6f},{lon:.6f})'
              '["highway"~"^(residential|tertiary|secondary|primary|trunk|unclassified|living_street|service|'

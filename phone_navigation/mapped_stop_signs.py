@@ -1,5 +1,6 @@
 """Conservative, route-direction-matched OpenStreetMap stop-sign hints."""
 import json
+from .offline_stop_data import local_elements
 import math
 from urllib.parse import urlencode
 from urllib.error import HTTPError
@@ -104,6 +105,11 @@ def fetch_stops(route, start, opener=urlopen):
     samples = route_samples(route, start, end)
     if len(samples) < 2:
         return [], end
+    center = samples[len(samples)//2]
+    radius = max(meters(center, p) for p in samples) + 100
+    elements = local_elements(center, radius)
+    if elements is not None:
+        return match_stops(route, elements, start, end), end
     coords = ','.join(f'{p[1]:.6f},{p[0]:.6f}' for p in samples)
     query = f'[out:json][timeout:15];node["highway"="stop"](around:35,{coords})->.stops;(.stops;way(bn.stops)[highway];);out body geom;'
     failures = []

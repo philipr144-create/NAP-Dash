@@ -47,6 +47,11 @@ function render(result){
   if(!navSwitchBusy){$('nav-influence').checked=result.enabled===true;$('nav-influence').indeterminate=false;}
   const bridge=result.bridge||{};
   $('influence-status').textContent=`${bridge.state==='ready'?'ON · guidance available':bridge.state==='paused'?'ON · guidance PAUSED':bridge.state==='off'?'OFF · directions only':'Bridge state unavailable'}: ${bridge.reason||'Restart to load bridge diagnostics.'}`;
+  if(result.maneuvers_enabled===false){
+    $('influence-status').textContent+=' · Turn assistance is OFF. Enable navigation influence while parked to coordinate both settings.';
+  }else if(result.maneuvers_enabled!==true){
+    $('influence-status').textContent+=' · Model maneuver setting unavailable.';
+  }
   const nav=result.navigation||{},m=nav.maneuver;
   const decision=result.model_decision||{};
   const context=nav.route_context;

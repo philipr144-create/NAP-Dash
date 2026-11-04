@@ -50,3 +50,9 @@ def require_park(now=None):
             or not abs(cs['speed']) <= .05 or not abs(cs['raw_speed']) <= .05
             or cc['enabled'] or cc['lat_active'] or cc['long_active'] or cs['cruise_enabled']):
         raise ValueError('Park and disengage all controls to enable this setting.')
+
+
+def motion_sample(now=None):
+    """Plain source-stamped wheel data for the observation-only estimator."""
+    samples = _fresh(time.monotonic() if now is None else now)
+    return samples.get('carState')

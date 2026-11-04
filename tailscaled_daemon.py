@@ -240,7 +240,17 @@ def main():
         candidate_route = current_route
         candidate_count = 1
       if candidate_count >= max(1, ROUTE_STABLE_CHECKS):
-        restart_reason = "default route changed"
+        # Tailscale automatically rebinds after route changes.
+        # Do not terminate a healthy tunnel.
+        print("nap_tailscaled: network route changed; allowing rebind", flush=True)
+        applied_route = current_route
+        candidate_route = None
+        candidate_count = 0
+        health_failures = 0
+        started_at = now
+        FUNNEL.failures = 0
+        FUNNEL.successes = 0
+        FUNNEL.state = "network transition; allowing reconnect"
     else:
       candidate_route = None
       candidate_count = 0

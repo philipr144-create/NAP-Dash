@@ -1,3 +1,4 @@
+from pathlib import Path
 """Static setup PIN for the NAP phone navigation remote.
 
 The six-digit PIN only authorizes initial browser pairing.
@@ -12,7 +13,10 @@ DEFAULT_PAIR_CODE = "087911"
 
 
 def _pair_code():
-    code = os.environ.get("NAP_PHONE_PAIR_CODE", DEFAULT_PAIR_CODE).strip()
+    try:
+        code = Path("/data/nap_private/phone_pairing_code").read_text().strip()
+    except OSError:
+        code = os.environ.get('NAP_PHONE_PAIR_CODE', DEFAULT_PAIR_CODE).strip()
     if len(code) != 6 or not code.isdigit():
         return DEFAULT_PAIR_CODE
     return code

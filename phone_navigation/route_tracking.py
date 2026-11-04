@@ -1,5 +1,6 @@
 """Route tracking on the comma. No actuator or control interfaces."""
 import math
+from bisect import bisect_left, bisect_right
 import json
 import os
 from pathlib import Path
@@ -9,12 +10,28 @@ import uuid
 import tempfile
 from .mapped_stop_signs import fetch_stops
 from .road_stop_lookup import RoadStopLookup
-from .vehicle_snapshot import wheel_speed
+from .vehicle_snapshot import wheel_speed, motion_sample
+from .vehicle_snapshot import wheel_speed as wheel_speed_sample
+from .navigation_timing import ProgressTiming, ManeuverCompletion
+from .position_observer import PositionObserver, observation_snapshot
+from .segment_match import nearest_segment
+from .tesla_gps_assist import select_fix, enabled as tesla_gps_enabled
+from .navigation_trace import NavigationTrace, snapshot as trace_snapshot
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
 ROUTE_CACHE_PATH = Path('/data/nap_active_route.json')
 ROUTE_CACHE_MAX_BYTES = 4_000_000
+GUIDANCE_INTERVAL_S = 0.2
+ROAD_LOOKUP_INTERVAL_S = 1.0
 MAP_STATUS_PATH = Path('/data/nap_map_lookup_status.json')
+
+
+def navigation_maneuvers_enabled():
+    try:
+        from openpilot.common.params import Params
+        return Params().get_bool("NAPNavigationManeuvers")
+    except (ImportError, OSError):
+        return None
 
 
 def mapped_stops_enabled(path=STOP_SETTINGS_PATH):
@@ -71,38 +88,23 @@ class Route:
                 raise ValueError('Invalid route instructions')
 
     def match(self, location, progress, ahead, bearing=None):
-        best = None
-        candidates = []
-        self.heading_error_deg = None
-        for (a, aa), (b, ba) in zip(self.points, self.points[1:]):
-            if ba-aa < .01 or ba < progress - 25 or aa > progress + ahead:
-                continue
-            scale = math.cos(math.radians(location[1]))
-            x, y = (b[0]-a[0])*scale, b[1]-a[1]
-            u, v = (location[0]-a[0])*scale, location[1]-a[1]
-            t = max(0, min(1, (u*x+v*y)/(x*x+y*y or 1)))
-            error = distance(location, [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t])
-            segment_bearing = math.degrees(math.atan2(x, y)) % 360
-            heading_error = (abs((segment_bearing-bearing+180) % 360-180)
-                             if bearing is not None and math.isfinite(bearing) else None)
-            if heading_error is not None and heading_error > 35:
-                continue
-            candidates.append((error, aa+(ba-aa)*t))
-            if best is None or error < best[0]:
-                best = error, aa+(ba-aa)*t
-                self.heading_error_deg = heading_error
-        # Nearby but substantially different positions along the route are ambiguous.
-        # Do not jump to a later loop, crossing, or parallel route segment.
-        self.match_ambiguous = best is not None and any(
-            error <= best[0]+8 and abs(along-best[1]) > 60
-            for error, along in candidates)
+        key = lambda point: point[1]
+        start = max(0, bisect_left(self.points, progress-25, key=key)-1)
+        end = min(len(self.points)-1, bisect_right(self.points, progress+ahead, key=key))
+        lon, lat = location
+        scale = math.cos(math.radians(lat))
+        def xy(point):
+            return (111195 * (point[0]-lon) * scale, 111195 * (point[1]-lat))
+        best, self.match_ambiguous = nearest_segment(self.points, 0, 0, bearing, start, end, xy)
+        self.heading_error_deg = best[2] if best else None
         self.match_error_m = best[0] if best else None
-        return None if self.match_ambiguous else best
+        return None if best is None or self.match_ambiguous else best[:2]
 
-    def guidance(self, progress, label, route_id):
+    def guidance(self, progress, label, route_id, selected_index=None):
         # Retain the intersection until actually passed; do not skip it 6 m early.
-        index, step = next(((i, s) for i, s in enumerate(self.steps) if i > 0 and s['at'] >= progress-8),
-                           (len(self.steps)-1, self.steps[-1]))
+        index, step = (next(((i, s) for i, s in enumerate(self.steps) if i > 0 and s['at'] >= progress-8),
+                           (len(self.steps)-1, self.steps[-1])) if selected_index is None
+                       else (selected_index, self.steps[selected_index]))
         maneuver = step['maneuver']
         kind, modifier = str(maneuver.get('type', '')), str(maneuver.get('modifier', ''))
         road = (' onto ' + str(step['name'])) if step.get('name') else ''
@@ -153,7 +155,8 @@ def valid_fix(message, mono, now, wall, valid=True, source='gpsLocation'):
         # Report unknown, rather than presenting it as perfect accuracy.
         if source == 'gpsLocationExternal' and accuracy == 0:
             return None
-        return {'point': point, 'mono': now-max(age, max(0, gps_age)), 'accuracy_m': accuracy or None,
+        return {'point': point, 'mono': now-max(age, max(0, gps_age)), 'sample_mono': mono,
+                'accuracy_m': accuracy or None,
                 'speed': speed, 'bearing_deg': bearing % 360 if math.isfinite(bearing) else None,
                 'source': source}
     except (ValueError, TypeError, AttributeError, OverflowError):
@@ -168,7 +171,7 @@ class CommaLocation:
         # Construct and use the messaging subscriber only on its worker thread.
         if self.sm is None:
             from cereal import messaging
-            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal'])
+            self.sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'livePose'])
         self.sm.update(0)
         now, wall = time.monotonic(), time.time()
         fixes = []
@@ -187,6 +190,22 @@ class CommaLocation:
         result = max(measured, key=lambda f: f['mono']) if measured else freshest
         result['wheel_speed'] = wheel_speed(now)
         return result
+
+
+    def observation_pose(self, now):
+        """Motion-only input; it does not replace a GNSS fix or control gate."""
+        try:
+            service = 'livePose'
+            if self.sm is None or not self.sm.seen[service]:
+                return None
+            message = self.sm[service]
+            orientation = message.orientationNED
+            return {'mono': self.sm.logMonoTime[service] / 1e9,
+                    'yaw_rad': float(orientation.z), 'yaw_std_rad': float(orientation.zStd),
+                    'valid': bool(self.sm.valid[service] and self.sm.alive[service]
+                                  and message.inputsOK and message.sensorsOK and orientation.valid)}
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
 
 
 def model_decision(path='/dev/shm/nap_navigation_decision.json'):
@@ -209,6 +228,12 @@ class NavigationTracker:
         self.location = location if location is not None else CommaLocation()
         self.road_stops = RoadStopLookup()
         self.lock = threading.RLock()
+        self.timing = ProgressTiming()
+        self.completion = ManeuverCompletion()
+        self.trace = NavigationTrace()
+        self.position_observer = PositionObserver()
+        self.position_observation = {'mode': 'live_guidance', 'used_for_control': False, 'used_for_guidance': False,
+                                     'valid': False, 'reason': 'waiting_for_inputs'}
         self.quit = threading.Event()
         self.worker = None
         self.generation = 0
@@ -246,6 +271,7 @@ class NavigationTracker:
         self.off_since = None
         self.nav = {'route_state': 'inactive'}
         self.message = 'Choose a destination. The comma supplies GPS.'
+        self.cache_retry_pending = False
         self.restore_cache()
 
     def save_cache(self):
@@ -283,11 +309,21 @@ class NavigationTracker:
 
     def restore_cache(self):
         try:
-            raw = self.cache_path.read_bytes()
+            with self.cache_path.open('rb') as stream:
+                raw = stream.read(ROUTE_CACHE_MAX_BYTES+1)
             if len(raw) > ROUTE_CACHE_MAX_BYTES:
                 return
             data = json.loads(raw)
-            if data.get('version') != 1 or not 0 <= time.time()-data['saved_at'] <= 24*3600:
+            age = time.time()-data['saved_at']
+            if data.get('version') != 1:
+                return
+            if age < 0:
+                # AGNOS can start with an old clock before time synchronization.
+                # Retry this saved route after the clock catches up.
+                self.cache_retry_pending = True
+                return
+            self.cache_retry_pending = False
+            if age > 24*3600:
                 return
             destination = data['destination']
             coordinate(destination['location'])
@@ -298,16 +334,21 @@ class NavigationTracker:
             stops = data.get('stop_points', [])
             if not isinstance(stops, list) or len(stops) > 500:
                 return
-            self.destination, self.route, self.route_id, self.progress = destination, route, data['route_id'], progress
-            self.stop_points = [s for s in stops if isinstance(s, dict) and isinstance(s.get('id'), str)
+            stop_points = [s for s in stops if isinstance(s, dict) and isinstance(s.get('id'), str)
                                 and type(s.get('at_m')) in (int, float) and 0 <= s['at_m'] <= route.length]
-            self.stop_coverage_end = min(route.length, max(0, float(data.get('stop_coverage_end', 0))))
+            coverage = float(data.get('stop_coverage_end', 0))
+            if not math.isfinite(coverage):
+                return
+            coverage = min(route.length, max(0, coverage))
+            # Commit only after the complete cache has passed validation.
+            self.destination, self.route, self.route_id, self.progress = destination, route, data['route_id'], progress
+            self.stop_points, self.stop_coverage_end = stop_points, coverage
             self.stop_state = 'ready' if self.stop_coverage_end > self.progress else 'waiting'
             self.reacquire_until = time.monotonic()+120
             self.bridge.route_active = True
             self.message = 'Cached route restored. Waiting for fresh comma GPS.'
             self.nav = {'route_state': 'recalculating'}
-        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        except (OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError, RecursionError):
             return
 
     def start_worker(self):
@@ -316,19 +357,30 @@ class NavigationTracker:
             self.worker.start()
 
     def run(self):
+        next_road_lookup = -1e9
+        next_cache_retry = -1e9
         while not self.quit.is_set():
+            cycle_start = time.monotonic()
             try:
+                with self.lock:
+                    if (self.cache_retry_pending and self.destination is None
+                            and cycle_start >= next_cache_retry):
+                        next_cache_retry = cycle_start + 5
+                        self.restore_cache()
                 fix = self.location.sample()
                 self.tick(fix)
-                # The road lookup fills gaps while route stop coverage is
-                # unavailable. Avoid duplicate map requests once the route
-                # has usable cached stop coverage at the current progress.
-                with self.lock:
-                    route_stop_covered = (self.nav.get('route_state') == 'active'
-                                          and mapped_stops_enabled()
-                                          and self.stop_state in ('ready', 'partial')
-                                          and self.progress <= self.stop_coverage_end)
-                self.road_stops.tick(fix, route_stop_covered)
+                # Optional map work stays at 1 Hz; only guidance runs faster.
+                if cycle_start >= next_road_lookup:
+                    next_road_lookup = cycle_start + ROAD_LOOKUP_INTERVAL_S
+                    # The road lookup fills gaps while route stop coverage is
+                    # unavailable. Avoid duplicate map requests once the route
+                    # has usable cached stop coverage at the current progress.
+                    with self.lock:
+                        route_stop_covered = (self.nav.get('route_state') == 'active'
+                                              and mapped_stops_enabled()
+                                              and self.stop_state in ('ready', 'partial')
+                                              and self.progress <= self.stop_coverage_end)
+                    self.road_stops.tick(self.fix, route_stop_covered)
             except Exception:
                 with self.lock:
                     self.fix = None
@@ -337,7 +389,9 @@ class NavigationTracker:
                         self.message = 'Navigation paused: comma location service unavailable.'
                     except OSError:
                         self.message = 'Navigation bridge write failed; guidance will expire.'
-            self.quit.wait(1.0)
+            # Include work time in the period. Never burst through missed
+            # iterations after slow I/O; stale guidance still expires normally.
+            self.quit.wait(max(0.0, GUIDANCE_INTERVAL_S - (time.monotonic()-cycle_start)))
 
     def status(self):
         with self.lock:
@@ -348,8 +402,16 @@ class NavigationTracker:
             next_stop = self.next_stop() if stop_enabled else None
             return {'ok': True, 'enabled': bridge_status['enabled'], 'bridge': bridge_status, 'gps_ready': fresh,
                     'accuracy_m': self.fix['accuracy_m'] if fresh else None,
-                    'destination': self.destination, 'navigation': self.nav,
+                    'accuracy_source': self.fix.get('accuracy_source', self.fix['source']) if fresh else None,
+                    'route_match': self.route_match_status(),
+                    'trace': {'records_this_process':self.trace.count,'last_error':self.trace.error},
+                    'tesla_gps_assist': {'enabled': tesla_gps_enabled(),
+                                         'position_source': self.fix['source'] if fresh else None},
+                    'position_observer': observation_snapshot(self.position_observation, now),
+                    'destination': self.destination, 'navigation': self.current_guidance(now),
+                    'control_navigation': self.nav,
                     'message': self.message, 'active': self.destination is not None,
+                    'maneuvers_enabled': navigation_maneuvers_enabled(),
                     'model_decision': model_decision(), 'road_stops': self.road_stops.status(),
                     'mapped_stops': {'enabled': stop_enabled,
                                      'state': self.stop_state if stop_enabled else 'off',
@@ -418,8 +480,21 @@ class NavigationTracker:
                          name='nap-mapped-stops', daemon=True).start()
 
     def set_enabled(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError('enabled must be a boolean')
+        if enabled:
+            from .vehicle_snapshot import require_park
+            require_park()
+        from openpilot.common.params import Params
         with self.lock:
-            self.bridge.set_enabled(enabled)
+            # Keep the paired switch and the model's persisted permission aligned.
+            # Set the bridge last when enabling so a failed parameter write cannot
+            # advertise navigation authority that the model did not receive.
+            if not enabled:
+                self.bridge.set_enabled(False)
+            Params().put_bool("NAPNavigationManeuvers", enabled)
+            if enabled:
+                self.bridge.set_enabled(True)
             return self.status()
 
     def start(self, destination):
@@ -427,6 +502,7 @@ class NavigationTracker:
         label = str(destination.get('label', 'Destination'))[:160]
         with self.lock:
             self.generation += 1
+            self.cache_retry_pending = False
             self.bridge.route_active = True
             self.bridge.clear('New destination; waiting for route and GPS')
             if self.clear:
@@ -446,6 +522,7 @@ class NavigationTracker:
     def stop(self):
         with self.lock:
             self.generation += 1
+            self.cache_retry_pending = False
             self.destination = None
             self.clear_cache()
             self.route = None
@@ -513,13 +590,70 @@ class NavigationTracker:
         threading.Thread(target=self.fetch, args=(self.fix['point'], dict(self.destination), self.generation),
                          name='nap-route-request', daemon=True).start()
 
+    def observe_position(self, fix, now):
+        # Failures in this diagnostic path cannot clear/advance a route, write a
+        # desire, reserve a blinker, or replace production coordinates/progress.
+        with self.lock:
+            try:
+                route = self.route
+                self.position_observer.route(self.route_id if route is not None else None,
+                                             route.points if route is not None else (),
+                                             route.steps if route is not None else ())
+                pose_reader = getattr(self.location, 'observation_pose', None)
+                pose = pose_reader(now) if pose_reader is not None else None
+                self.position_observation = self.position_observer.update(fix, motion_sample(now), pose, now)
+            except Exception as exc:
+                self.position_observation = {'mode': 'live_guidance', 'used_for_control': False, 'used_for_guidance': False,
+                                             'valid': False, 'received_mono': now,
+                                             'reason': 'observer_error', 'error': type(exc).__name__}
+
+    def route_match_status(self):
+        return {'cross_track_m': getattr(self.route, 'match_error_m', None),
+                'heading_error_deg': getattr(self.route, 'heading_error_deg', None),
+                'ambiguous': getattr(self.route, 'match_ambiguous', False)}
+
+    def record_trace(self, event, now, fix=None, found=None, nav=None):
+        decision=trace_snapshot('/dev/shm/nap_navigation_decision.json',now,'received_mono')
+        signal=trace_snapshot('/dev/shm/nap_navigation_signal_status.json',now,'time',1)
+        request=trace_snapshot('/dev/shm/nap_navigation_signal_request.json',now,'time',1)
+        data={'generation':self.generation,'gps':fix,'match':found,'route_match':self.route_match_status(),'progress_m':self.progress,
+              'position_observer':self.position_observation,
+              'timing':{'reason':self.timing.reason,'raw_m':self.timing.raw,'innovation_m':self.timing.innovation},
+              'guidance':{k:(nav or self.nav).get(k) for k in ('route_state','maneuver_id','maneuver')},
+              'model':decision,'signal':signal,'signal_request':request}
+        self.trace.write(event,now,self.route_id,data,self.route.raw if self.route is not None else None,
+                         continuous=event=='guidance' or self.route is not None)
+
+    def current_guidance(self, now):
+        return self.nav
+
+    def publish_guidance(self, was_active):
+        # The observer is diagnostic. Publish one route state and maneuver.
+        if self.update and self.nav.get('route_state') in ('active', 'arrived'):
+            self.update(self.nav)
+        elif was_active and self.clear:
+            self.clear()
+
     def tick(self, fix, now=None):
         now = time.monotonic() if now is None else now
         with self.lock:
+            was_active = self.nav.get('route_state') in ('active', 'arrived')
+            self.control_tick(fix, now)
+            self.publish_guidance(was_active)
+
+    def control_tick(self, fix, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            fix = select_fix(now, self.route, self.progress, fix, wheel_speed_sample(now))
+            if fix is not None and (fix['speed'] < 2 or
+                                    fix.get('wheel_speed') is not None and fix['wheel_speed'] < 2):
+                fix = dict(fix, bearing_deg=None)
             self.fix = fix
+            self.observe_position(fix, now)
             if self.destination is None:
                 self.bridge.route_active = False
                 self.bridge.clear('No route selected')
+                self.record_trace('no_route', now, fix)
                 return
             if fix is None or not 0 <= now-fix['mono'] <= 3:
                 self.bridge.clear('GPS missing or stale; guidance paused')
@@ -531,10 +665,12 @@ class NavigationTracker:
 
                 self.nav = {'route_state': 'calculating' if self.route is None else 'recalculating'}
                 self.message = 'Waiting for comma GPS. Turn the car on with a clear view of the sky.'
+                self.record_trace('gps_unavailable', now, fix)
                 return
             if self.route is None:
                 self.bridge.clear('Route calculation pending')
                 self.maybe_fetch(now)
+                self.record_trace('route_pending', now, fix)
                 return
             elapsed = max(1, now-self.last_match)
 
@@ -547,17 +683,30 @@ class NavigationTracker:
             if now <= self.reacquire_until:
                 ahead = max(ahead, 10000)
 
-            found = self.route.match(fix['point'], self.progress, ahead, fix.get('bearing_deg'))
+            # Anchor each GPS observation once. Re-matching a projected old
+            # fix against advanced progress can count its projection twice.
+            match_key = (id(self.route), self.route_id, fix.get('source'),
+                         fix.get('sample_mono', fix['mono']))
+            if match_key != getattr(self, '_match_key', None):
+                self._match_found = self.route.match(fix['point'], self.progress, ahead,
+                                                     fix.get('bearing_deg'))
+                self._match_key = match_key
+            found = self._match_found
             if found is None or found[0] > 40:
                 self.bridge.clear('Off route or uncertain GPS; guidance paused')
                 self.nav = {'route_state': 'recalculating'}
                 self.message = ('Ambiguous route position; navigation influence paused.'
                                 if getattr(self.route, 'match_ambiguous', False) else
                                 'Off route or uncertain GPS. Navigation influence paused.')
-                if self.off_since is None:
+                # Ambiguity or missing heading is not evidence of leaving the route.
+                # Require sustained geometric separation and a new fix to retry.
+                if self.route.match_ambiguous or self.route.match_error_m is None:
+                    self.off_since = None
+                elif self.off_since is None:
                     self.off_since = now
-                if now-self.off_since >= 5:
+                elif now-self.off_since >= 5 and fix['mono'] > self.last_request:
                     self.maybe_fetch(now)
+                self.record_trace('match_uncertain', now, fix, found)
                 return
             self.off_since = None
             self.reacquire_until = 0.0
@@ -569,13 +718,26 @@ class NavigationTracker:
                                 and self.route.heading_error_deg is not None
                                 and self.route.heading_error_deg <= 20
                                 and not self.route.match_ambiguous)
-            projected = found[1] + (wheel_speed*age if projection_valid else 0.0)
-            self.progress = max(self.progress, min(self.route.length, projected))
+            timed = self.timing.update(self.route_id, match_key, found[1], fix['mono'], now,
+                                       wheel_speed, fix['accuracy_m'], projection_valid, gps_speed=fix['speed'])
+            if timed is None:
+                self.bridge.clear('GPS progress discontinuity; waiting for a coherent fix')
+                self.nav = {'route_state':'recalculating'}
+                self.message = 'GPS progress jump rejected; waiting for a coherent position.'
+                self.record_trace('gps_jump_rejected', now, fix, found)
+                return
+            projected = timed
+            projection_valid = projection_valid and self.timing.trusted
+            self.progress = max(0., min(self.route.length, projected))
             self.last_match = now
             if now-self.last_cache_write >= 60:
                 self.save_cache()
             self.maybe_fetch_mapped_stops(now)
-            nav = self.route.guidance(self.progress, self.destination['label'], self.route_id)
+            selected = self.completion.index(self.route,self.route_id,self.progress,found[1],
+                                             fix.get('bearing_deg'),self.route.heading_error_deg,projection_valid)
+            nav = self.route.guidance(self.progress, self.destination['label'], self.route_id, selected)
+            if fix['source'] == 'tesla-can':
+                nav['source'] = 'tesla-can'
             nav['route_context'].update(projection_valid=projection_valid,
                                         heading_error_deg=self.route.heading_error_deg,
                                         path_ambiguous=self.route.match_ambiguous,
@@ -593,7 +755,6 @@ class NavigationTracker:
             # Bound IPC size regardless of provider road-name lengths.
             self.bridge.route_active = nav['route_state'] != 'arrived'
             self.bridge.publish(nav, (now-fix['mono'])*1000)
-            if self.update:
-                self.update(nav)
             self.nav = nav
+            self.record_trace('guidance', now, fix, found, nav)
             self.message = 'Arrived. You can stop guidance.' if nav['route_state'] == 'arrived' else 'The comma is following your route. You can close this page.'

@@ -1,0 +1,15 @@
+[Unit]
+Description=NAP read-only MCU route CAN diagnostics
+
+[Service]
+User=comma
+WorkingDirectory=/data/openpilot
+Environment=PYTHONPATH=/data:/data/openpilot
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/venv/bin/python3 /data/nap-mcp/mcu_route_diag.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+Nice=10
+CPUQuota=5%
+MemoryMax=80M

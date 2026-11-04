@@ -1,0 +1,29 @@
+[Unit]
+Description=NAP read-only OAuth MCP bridge
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=comma
+Group=comma
+WorkingDirectory=/data/nap-mcp
+ExecStart=/usr/local/venv/bin/python3 /data/nap-mcp/bridge.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/nap-mcp
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=80M
+CPUQuota=10%
+TasksMax=16
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

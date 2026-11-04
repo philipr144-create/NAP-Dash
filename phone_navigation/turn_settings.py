@@ -23,7 +23,7 @@ def read():
     params=Params()
     for name,key in PARAM_KEYS.items():
         value=params.get(key)
-        if type(value) is bool: result[name]=value
+        if value is not None: result[name]=params.get_bool(key)
     return result
 
 

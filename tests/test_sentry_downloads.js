@@ -1,0 +1,14 @@
+const assert=require('node:assert/strict'),fs=require('node:fs');
+const page=fs.readFileSync(__dirname+'/../sentry_page.py','utf8');
+const script=page.match(/<script>([\s\S]*)<\/script>/)[1];
+const cameras=['road','wideRoad','driver'];const created=[];
+global.document={createElement(tag){const x={tag,children:[],append(v){this.children.push(v)}};created.push(x);return x}};
+const cameraLabel=c=>({road:'Front',wideRoad:'Wide front',driver:'Cabin'}[c]);
+const begin=script.indexOf('function addDownloads('),end=script.indexOf('async function history()',begin);
+eval(script.slice(begin,end));
+const box={items:[],append(x){this.items.push(x)}};
+addDownloads(box,{id:'a'.repeat(32),state:'ready',cameras:{road:{state:'ready'},wideRoad:{state:'ready'},driver:{state:'failed'},unknown:{state:'ready'}}});
+assert.deepEqual(box.items.map(x=>x.textContent),['Download Front','Download Wide front']);
+box.items=[];addDownloads(box,{state:'snapshot'});assert.deepEqual(box.items.map(x=>x.textContent),['Download photo']);
+box.items=[];addDownloads(box,{state:'recording'});assert.equal(box.items.length,0);
+console.log('Camera download choices, unavailable-camera filtering and snapshots passed.');

@@ -1,5 +1,6 @@
 """Single server-owned switch and atomic, short-lived model guidance snapshot."""
 import json
+import math
 import os
 import tempfile
 import time
@@ -78,7 +79,13 @@ class DesireBridge:
     def publish(self, nav, age_ms):
         now = time.monotonic()
         context = nav.get('route_context', {})
-        self.write({'version': 4, 'enabled': self.enabled, 'route_active': self.route_active, 'received_mono': now,
+        angle=None
+        upcoming=context.get('upcoming',[])
+        matching=[m for m in upcoming if isinstance(m,dict) and m.get('maneuver_id')==nav.get('maneuver_id')] if isinstance(upcoming,list) else []
+        if len(matching)==1:
+            value=matching[0].get('turn_angle_deg')
+            if type(value) in (int,float) and math.isfinite(value) and -180<=value<=180:angle=value
+        self.write({'turn_context': {'expected_angle_deg':angle, 'source':'route_bearings', 'used_for_steering':False}, 'version': 4, 'enabled': self.enabled, 'route_active': self.route_active, 'received_mono': now,
                     'expires_mono': now + max(0, min(3.0, 5.0 - age_ms / 1000)),
                     'route_id': nav['route_id'], 'route_state': nav['route_state'],
                     'maneuver_id': nav.get('maneuver_id', ''),
