@@ -77,6 +77,9 @@ class UnifiedMapTests(unittest.TestCase):
         self.assertEqual(results[-1]['lane']['state'],'estimated')
         self.assertEqual(results[-1]['lane']['lane_count'],3)
         self.assertEqual(results[-1]['lane']['lane_index_from_left'],2)
+        self.assertEqual(results[-1]['display_pose']['state'], 'illustrative_lane_center_alignment')
+        self.assertFalse(results[-1]['display_pose']['used_for_control'])
+        self.assertEqual(results[-1]['pose']['source'], 'existing_position_observer_fallback')
         self.assertFalse(results[-1]['map_control_authorized'])
         self.assertFalse(results[-1]['used_for_guidance'])
         self.assertFalse(results[-1]['used_for_control'])
@@ -177,6 +180,13 @@ class TeslaPoseTests(unittest.TestCase):
         self.assertTrue(r['valid'],r)
         self.assertGreater(r['heading_deg'],50)
         self.assertLess(r['heading_deg'],51)
+
+    def test_650ms_can_stagger_is_aligned_not_discarded(self):
+        r=tesla_motion_pose(self.sample(pos_stamp=.5,heading_stamp=1.15),
+                            self.history(),1.5)
+        self.assertTrue(r['valid'],r)
+        self.assertAlmostEqual(r['position_heading_can_skew_s'],.65,places=2)
+        self.assertEqual(r['heading_deg'],0)
 
     def test_tesla_position_heading_skew_fails_closed(self):
         r=tesla_motion_pose(self.sample(pos_stamp=0.,heading_stamp=1.5),self.history(),1.5)
