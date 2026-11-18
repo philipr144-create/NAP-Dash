@@ -88,7 +88,9 @@ def route_candidate(route, progress, candidate):
     if best is None:
         return {'state': 'no_segment'}
     distance, along, heading = best
-    state = 'ambiguous' if ambiguous else 'outside_route' if distance > 25 else 'candidate'
+    state = ('ambiguous' if ambiguous else 'outside_route' if distance > 25
+             else 'heading_mismatch' if heading is not None and heading > 35
+             else 'candidate')
     return {'state': state, 'cross_track_m': round(distance, 2),
             'progress_m': round(along, 2),
             'heading_error_deg': round(heading, 2) if heading is not None else None}
