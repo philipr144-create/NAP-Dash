@@ -15,7 +15,7 @@ from .vehicle_snapshot import wheel_speed as wheel_speed_sample
 from .navigation_timing import ProgressTiming, ManeuverCompletion
 from .position_observer import PositionObserver, observation_snapshot
 from .segment_match import nearest_segment
-from .tesla_gps_assist import select_fix, enabled as tesla_gps_enabled
+from .tesla_gps_assist import select_fix, enabled as tesla_gps_enabled, diagnostic_status as tesla_gps_diagnostic_status
 from .navigation_trace import NavigationTrace, snapshot as trace_snapshot
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
@@ -242,6 +242,7 @@ class NavigationTracker:
         self.route_id = ''
         self.progress = 0
         self.fix = None
+        self.raw_comma_fix = None  # diagnostic only; never routed to control
         self.last_match = 0
         self.last_request = -1e9
         self.fetching = False
@@ -406,7 +407,9 @@ class NavigationTracker:
                     'route_match': self.route_match_status(),
                     'trace': {'records_this_process':self.trace.count,'last_error':self.trace.error},
                     'tesla_gps_assist': {'enabled': tesla_gps_enabled(),
-                                         'position_source': self.fix['source'] if fresh else None},
+                                         'position_source': self.fix['source'] if fresh else None,
+                                         'shadow_diagnostics': tesla_gps_diagnostic_status(
+                                             now, self.raw_comma_fix, wheel_speed_sample(now))},
                     'position_observer': observation_snapshot(self.position_observation, now),
                     'destination': self.destination, 'navigation': self.current_guidance(now),
                     'control_navigation': self.nav,
@@ -644,6 +647,7 @@ class NavigationTracker:
     def control_tick(self, fix, now=None):
         now = time.monotonic() if now is None else now
         with self.lock:
+            self.raw_comma_fix = fix
             fix = select_fix(now, self.route, self.progress, fix, wheel_speed_sample(now))
             if fix is not None and (fix['speed'] < 2 or
                                     fix.get('wheel_speed') is not None and fix['wheel_speed'] < 2):
