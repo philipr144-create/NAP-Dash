@@ -134,7 +134,9 @@ def road_candidates(point, heading_deg, world, limit=4):
                 direction = (direction+180) % 360
             err = bearing_error(heading_deg, direction)
             if not road.get('oneway'):
-                err = min(err, bearing_error(heading_deg, (direction+180) % 360))
+                reverse = (direction+180) % 360
+                if bearing_error(heading_deg,reverse) < err:
+                    direction,err=reverse,bearing_error(heading_deg,reverse)
             if road.get('oneway') and err > 60:
                 continue
             score = distance+.15*err
@@ -146,6 +148,8 @@ def road_candidates(point, heading_deg, world, limit=4):
                         'distance_m': round(distance,2),
                         'heading_error_deg': round(err,1),
                         'score': round(score,2),
+                        'nearest_centerline_enu_m':[round(a[0]+t*dx,2),round(a[1]+t*dy,2)],
+                        'road_travel_heading_deg': round(direction,2),
                         'oneway': road.get('oneway') is True,
                         'lanes_mapped': road.get('lanes_mapped'),
                         'width_m': road.get('width_m'),
@@ -340,4 +344,26 @@ class UnifiedNavigationShadow:
             lane['observations']=self.lane_count
             lane['confidence_kind']='camera_relative_plus_osm_count_not_surveyed'
         result['lane']=lane
+        if lane['state']=='estimated':
+            # Display-only camera/OSM alignment: no change to the GPS anchor,
+            # uncertainty budget, route progress, or any control permission.
+            center=first['nearest_centerline_enu_m']
+            direction=math.radians(first['road_travel_heading_deg'])
+            right_e,right_n=math.cos(direction),-math.sin(direction)
+            offset=((lane['lane_index_from_left']-(lane['lane_count']+1)/2)
+                    *lane['lane_width_vision_m']+lane['position_in_lane_m'])
+            origin=world['origin']
+            center_base=[origin['lon'],origin['lat']]
+            point=position_from_offset(center_base,center[0]+right_e*offset,
+                                       center[1]+right_n*offset)
+            correction=math.hypot(*meters_xy(point,{'lat':pose['point'][1],
+                                                     'lon':pose['point'][0]}))
+            result['display_pose']={'state':'illustrative_lane_center_alignment',
+                                    'point':[round(v,8) for v in point],
+                                    'heading_deg':pose['heading_deg'],
+                                    'lane_index_from_left':lane['lane_index_from_left'],
+                                    'osm_way_id':first['way_id'],
+                                    'raw_to_visual_shift_m':round(correction,2),
+                                    'used_for_control':False,
+                                    'source_note':'OSM centreline and camera road edges are not surveyed lane geometry'}
         return result
