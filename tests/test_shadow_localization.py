@@ -60,6 +60,31 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(r['tesla']['reason'], 'position_motion_timestamp_skew')
         self.assertFalse(r['tesla']['valid'])
 
+    def test_reverse_direction_does_not_count_as_route_agreement(self):
+        comma, tesla = fixes()
+        comma['bearing_deg'] = 270.
+        tesla[1]['heading_deg'] = 270.
+        r = evaluate(10., comma, tesla, 20., Route(), 45.)
+        self.assertEqual(r['result'], 'route_candidate_conflict')
+        self.assertEqual(r['route_candidates']['tesla']['state'], 'heading_mismatch')
+        self.assertFalse(r['map_control_authorized'])
+
+    def test_both_gps_wrong_about_road_is_not_agreement(self):
+        comma, tesla = fixes()
+        comma['point'][1] += .001
+        tesla[0]['point'][1] += .001
+        r = evaluate(10., comma, tesla, 20., Route(), 45.)
+        self.assertEqual(r['result'], 'route_candidate_conflict')
+        self.assertFalse(r['map_control_authorized'])
+
+    def test_unknown_receiver_accuracy_is_not_considered_verified(self):
+        comma, tesla = fixes()
+        comma['accuracy_m'] = None
+        r = evaluate(10., comma, tesla, 20.)
+        self.assertEqual(r['receiver_agreement'], 'accuracy_unknown')
+        self.assertEqual(r['result'], 'receiver_consistent_route_unverified')
+        self.assertFalse(r['map_control_authorized'])
+
     def test_pair_is_counted_only_once(self):
         comma, tesla = fixes()
         r = evaluate(10., comma, tesla, 20., Route(), 45.)
