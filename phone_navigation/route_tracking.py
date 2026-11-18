@@ -10,7 +10,7 @@ import uuid
 import tempfile
 from .mapped_stop_signs import fetch_stops
 from .road_stop_lookup import RoadStopLookup
-from .vehicle_snapshot import wheel_speed, motion_sample
+from .vehicle_snapshot import wheel_speed, motion_sample, model_sample
 from .vehicle_snapshot import wheel_speed as wheel_speed_sample
 from .navigation_timing import ProgressTiming, ManeuverCompletion
 from .position_observer import PositionObserver, observation_snapshot
@@ -18,6 +18,7 @@ from .segment_match import nearest_segment
 from .tesla_gps_assist import (select_fix, enabled as tesla_gps_enabled,
                                diagnostic_status as tesla_gps_diagnostic_status, read_fix as read_tesla_fix)
 from .shadow_localization import evaluate as evaluate_shadow, ShadowSession
+from .unified_nav_shadow import UnifiedNavigationShadow
 from .navigation_trace import NavigationTrace, snapshot as trace_snapshot
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
@@ -246,6 +247,12 @@ class NavigationTracker:
         self.fix = None
         self.raw_comma_fix = None  # diagnostic only; never routed to control
         self.shadow_session = ShadowSession()
+        self.unified_shadow = UnifiedNavigationShadow()
+        self.unified_last = -1e9
+        self.unified_navigation = {'mode': 'unified_nav_shadow_v1',
+                                   'used_for_control': False, 'used_for_guidance': False,
+                                   'map_control_authorized': False, 'reason': 'not_sampled',
+                                   'received_mono': None}
         self.shadow_last = -1e9
         self.shadow_localization = {'mode': 'shadow_localization_v1', 'result': 'not_sampled',
                                     'used_for_control': False, 'map_control_authorized': False,
@@ -421,6 +428,9 @@ class NavigationTracker:
                     'shadow_localization': dict(self.shadow_localization,
                                                 fresh=(self.shadow_localization.get('received_mono') is not None
                                                        and 0 <= now-self.shadow_localization['received_mono'] <= 1.5)),
+                    'unified_navigation': dict(self.unified_navigation,
+                                               fresh=(self.unified_navigation.get('received_mono') is not None
+                                                      and 0 <= now-self.unified_navigation['received_mono'] <= 1.5)),
                     'destination': self.destination, 'navigation': self.current_guidance(now),
                     'control_navigation': self.nav,
                     'message': self.message, 'active': self.destination is not None,
@@ -639,6 +649,24 @@ class NavigationTracker:
                                         'result': 'observer_error',
                                         'reason': type(exc).__name__, 'received_mono': now}
 
+    def observe_unified(self, now):
+        # Single diagnostic service: Tesla CAN position + existing motion history,
+        # OSM world geometry and existing modelV2 lane/road-edge samples.
+        # It never updates self.fix, self.nav, route progress, or control IPC.
+        if now-self.unified_last < .2:
+            return
+        self.unified_last = now
+        try:
+            self.unified_navigation = self.unified_shadow.update(
+                now, read_tesla_fix(now), self.position_observer,
+                self.position_observation, model_sample(now))
+        except Exception as exc:
+            self.unified_navigation = {'mode': 'unified_nav_shadow_v1',
+                                       'used_for_control': False, 'used_for_guidance': False,
+                                       'map_control_authorized': False,
+                                       'reason': 'observer_error',
+                                       'error': type(exc).__name__, 'received_mono': now}
+
     def route_match_status(self):
         return {'cross_track_m': getattr(self.route, 'match_error_m', None),
                 'heading_error_deg': getattr(self.route, 'heading_error_deg', None),
@@ -651,6 +679,7 @@ class NavigationTracker:
         data={'generation':self.generation,'gps':fix,'match':found,'route_match':self.route_match_status(),'progress_m':self.progress,
               'position_observer':self.position_observation,
               'shadow_localization':self.shadow_localization,
+              'unified_navigation':self.unified_navigation,
               'timing':{'reason':self.timing.reason,'raw_m':self.timing.raw,'innovation_m':self.timing.innovation},
               'guidance':{k:(nav or self.nav).get(k) for k in ('route_state','maneuver_id','maneuver')},
               'model':decision,'signal':signal,'signal_request':request}
@@ -686,6 +715,7 @@ class NavigationTracker:
                 fix = dict(fix, bearing_deg=None)
             self.fix = fix
             self.observe_position(fix, now)
+            self.observe_unified(now)
             if self.destination is None:
                 self.bridge.route_active = False
                 self.bridge.clear('No route selected')
