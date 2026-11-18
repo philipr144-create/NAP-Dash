@@ -1,0 +1,30 @@
+name: Unified NAP Navigation Shadow Tests
+
+on:
+  push:
+    branches:
+      - gps-dual-source-shadow-diagnostics-2026-11-18
+  pull_request:
+    paths:
+      - "phone_navigation/**"
+      - "tests/test_*shadow*.py"
+      - ".github/workflows/test-unified-nav-shadow.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  shadow-localization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile changed navigation modules
+        run: |
+          python -m py_compile phone_navigation/vehicle_snapshot.py phone_navigation/tesla_gps_assist.py phone_navigation/position_observer.py phone_navigation/shadow_localization.py phone_navigation/unified_nav_shadow.py phone_navigation/route_tracking.py
+      - name: Run synthetic GNSS, lane and OSM tests
+        run: |
+          python -m unittest discover -s tests -p "test_*shadow*.py" -v
