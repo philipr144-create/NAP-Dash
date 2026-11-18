@@ -10,12 +10,15 @@ import uuid
 import tempfile
 from .mapped_stop_signs import fetch_stops
 from .road_stop_lookup import RoadStopLookup
-from .vehicle_snapshot import wheel_speed, motion_sample
+from .vehicle_snapshot import wheel_speed, motion_sample, model_sample
 from .vehicle_snapshot import wheel_speed as wheel_speed_sample
 from .navigation_timing import ProgressTiming, ManeuverCompletion
 from .position_observer import PositionObserver, observation_snapshot
 from .segment_match import nearest_segment
-from .tesla_gps_assist import select_fix, enabled as tesla_gps_enabled
+from .tesla_gps_assist import (select_fix, enabled as tesla_gps_enabled,
+                               diagnostic_status as tesla_gps_diagnostic_status, read_fix as read_tesla_fix)
+from .shadow_localization import evaluate as evaluate_shadow, ShadowSession
+from .unified_nav_shadow import UnifiedNavigationShadow
 from .navigation_trace import NavigationTrace, snapshot as trace_snapshot
 
 STOP_SETTINGS_PATH = Path('/data/nap_turn_settings.json')
@@ -242,6 +245,18 @@ class NavigationTracker:
         self.route_id = ''
         self.progress = 0
         self.fix = None
+        self.raw_comma_fix = None  # diagnostic only; never routed to control
+        self.shadow_session = ShadowSession()
+        self.unified_shadow = UnifiedNavigationShadow()
+        self.unified_last = -1e9
+        self.unified_navigation = {'mode': 'unified_nav_shadow_v1',
+                                   'used_for_control': False, 'used_for_guidance': False,
+                                   'map_control_authorized': False, 'reason': 'not_sampled',
+                                   'received_mono': None}
+        self.shadow_last = -1e9
+        self.shadow_localization = {'mode': 'shadow_localization_v1', 'result': 'not_sampled',
+                                    'used_for_control': False, 'map_control_authorized': False,
+                                    'received_mono': None}
         self.last_match = 0
         self.last_request = -1e9
         self.fetching = False
@@ -406,8 +421,16 @@ class NavigationTracker:
                     'route_match': self.route_match_status(),
                     'trace': {'records_this_process':self.trace.count,'last_error':self.trace.error},
                     'tesla_gps_assist': {'enabled': tesla_gps_enabled(),
-                                         'position_source': self.fix['source'] if fresh else None},
+                                         'position_source': self.fix['source'] if fresh else None,
+                                         'shadow_diagnostics': tesla_gps_diagnostic_status(
+                                             now, self.raw_comma_fix, wheel_speed_sample(now))},
                     'position_observer': observation_snapshot(self.position_observation, now),
+                    'shadow_localization': dict(self.shadow_localization,
+                                                fresh=(self.shadow_localization.get('received_mono') is not None
+                                                       and 0 <= now-self.shadow_localization['received_mono'] <= 1.5)),
+                    'unified_navigation': dict(self.unified_navigation,
+                                               fresh=(self.unified_navigation.get('received_mono') is not None
+                                                      and 0 <= now-self.unified_navigation['received_mono'] <= 1.5)),
                     'destination': self.destination, 'navigation': self.current_guidance(now),
                     'control_navigation': self.nav,
                     'message': self.message, 'active': self.destination is not None,
@@ -607,6 +630,43 @@ class NavigationTracker:
                                              'valid': False, 'received_mono': now,
                                              'reason': 'observer_error', 'error': type(exc).__name__}
 
+    def observe_shadow(self, now, comma_fix):
+        # Independently evaluate candidates at ~2 Hz. Never replace self.fix,
+        # change production match state, or publish an IPC control message.
+        if now-self.shadow_last < .5:
+            return
+        self.shadow_last = now
+        try:
+            report = evaluate_shadow(now, comma_fix, read_tesla_fix(now),
+                                     wheel_speed_sample(now), self.route, self.progress)
+            report['session_counts'] = self.shadow_session.update(report)
+            report['received_mono'] = now
+            self.shadow_localization = report
+        except Exception as exc:
+            self.shadow_localization = {'mode': 'shadow_localization_v1',
+                                        'used_for_control': False, 'used_for_guidance': False,
+                                        'map_control_authorized': False,
+                                        'result': 'observer_error',
+                                        'reason': type(exc).__name__, 'received_mono': now}
+
+    def observe_unified(self, now):
+        # Single diagnostic service: Tesla CAN position + existing motion history,
+        # OSM world geometry and existing modelV2 lane/road-edge samples.
+        # It never updates self.fix, self.nav, route progress, or control IPC.
+        if now-self.unified_last < .2:
+            return
+        self.unified_last = now
+        try:
+            self.unified_navigation = self.unified_shadow.update(
+                now, read_tesla_fix(now), self.position_observer,
+                self.position_observation, model_sample(now))
+        except Exception as exc:
+            self.unified_navigation = {'mode': 'unified_nav_shadow_v1',
+                                       'used_for_control': False, 'used_for_guidance': False,
+                                       'map_control_authorized': False,
+                                       'reason': 'observer_error',
+                                       'error': type(exc).__name__, 'received_mono': now}
+
     def route_match_status(self):
         return {'cross_track_m': getattr(self.route, 'match_error_m', None),
                 'heading_error_deg': getattr(self.route, 'heading_error_deg', None),
@@ -618,11 +678,14 @@ class NavigationTracker:
         request=trace_snapshot('/dev/shm/nap_navigation_signal_request.json',now,'time',1)
         data={'generation':self.generation,'gps':fix,'match':found,'route_match':self.route_match_status(),'progress_m':self.progress,
               'position_observer':self.position_observation,
+              'shadow_localization':self.shadow_localization,
+              'unified_navigation':self.unified_navigation,
               'timing':{'reason':self.timing.reason,'raw_m':self.timing.raw,'innovation_m':self.timing.innovation},
               'guidance':{k:(nav or self.nav).get(k) for k in ('route_state','maneuver_id','maneuver')},
               'model':decision,'signal':signal,'signal_request':request}
         self.trace.write(event,now,self.route_id,data,self.route.raw if self.route is not None else None,
-                         continuous=event=='guidance' or self.route is not None)
+                         continuous=(event=='guidance' or self.route is not None
+                                     or (event=='no_route' and (wheel_speed_sample(now) or 0) >= 2)))
 
     def current_guidance(self, now):
         return self.nav
@@ -644,12 +707,15 @@ class NavigationTracker:
     def control_tick(self, fix, now=None):
         now = time.monotonic() if now is None else now
         with self.lock:
+            self.raw_comma_fix = fix
+            self.observe_shadow(now, fix)
             fix = select_fix(now, self.route, self.progress, fix, wheel_speed_sample(now))
             if fix is not None and (fix['speed'] < 2 or
                                     fix.get('wheel_speed') is not None and fix['wheel_speed'] < 2):
                 fix = dict(fix, bearing_deg=None)
             self.fix = fix
             self.observe_position(fix, now)
+            self.observe_unified(now)
             if self.destination is None:
                 self.bridge.route_active = False
                 self.bridge.clear('No route selected')
