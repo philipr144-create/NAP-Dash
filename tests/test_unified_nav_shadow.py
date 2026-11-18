@@ -149,12 +149,10 @@ class UnifiedMapTests(unittest.TestCase):
 class TeslaPoseTests(unittest.TestCase):
     def history(self):
         p=PositionObserver()
-        p.history=deque([
-            [0.,0.,0.,0.,0.,20.,.02],
-            [.5,0.,10.,10.,0.,20.,.02],
-            [1.,0.,20.,20.,0.,20.,.02],
-            [1.5,0.,30.,30.,0.,20.,.02],
-        ],maxlen=64)
+        # Observer rejects motion gaps above 450 ms, so reproduce normal
+        # high-frequency vehicle odometry rather than discontinuous 500 ms ticks.
+        p.history=deque([[i*.25,0.,i*5.,i*5.,0.,20.,.02]
+                         for i in range(7)],maxlen=64)
         return p
 
     def sample(self, pos_stamp=.5, heading_stamp=1.):
@@ -163,7 +161,7 @@ class TeslaPoseTests(unittest.TestCase):
 
     def test_1hz_can_position_is_interpolated_with_vehicle_odometry(self):
         r=tesla_motion_pose(self.sample(),self.history(),1.5)
-        self.assertTrue(r['valid'])
+        self.assertTrue(r['valid'],r)
         self.assertEqual(r['source'],'tesla_can_odometry_aligned')
         self.assertAlmostEqual(r['distance_predicted_m'],20.,places=2)
         self.assertAlmostEqual(r['position_heading_can_skew_s'],.5,places=3)
@@ -171,12 +169,12 @@ class TeslaPoseTests(unittest.TestCase):
 
     def test_old_heading_is_corrected_by_new_yaw(self):
         p=self.history()
-        p.history[2][4]=.1
-        p.history[3][4]=.2
+        p.history[4][4]=.1
+        p.history[6][4]=.2
         sample=self.sample()
         sample[1]['heading_deg']=45.
         r=tesla_motion_pose(sample,p,1.5)
-        self.assertTrue(r['valid'])
+        self.assertTrue(r['valid'],r)
         self.assertGreater(r['heading_deg'],50)
         self.assertLess(r['heading_deg'],51)
 
